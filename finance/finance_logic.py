@@ -3,22 +3,22 @@ import logging
 from decimal import Decimal
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
-from sqlalchemy.orm import Session
-from sqlalchemy import text
 from config import (
     AllocationKey, ALLOCATIONS, MAX_POINTS_VALUE, TAX_RATE,
     POINTS_DISCOUNT_RATE, MEMBER_PRODUCT_PRICE, COUPON_VALID_DAYS,
     PLATFORM_MERCHANT_ID, MAX_PURCHASE_PER_DAY, MAX_TEAM_LAYER,
     LOG_FILE
 )
+from core.db_adapter import PyMySQLAdapter
 
+# 配置日志：只输出到 logs/api.log，不输出到控制台
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(LOG_FILE, encoding='utf-8')
+    ],
+    force=True  # 强制重新配置，覆盖之前的配置
 )
 logger = logging.getLogger(__name__)
 
@@ -38,8 +38,14 @@ class InsufficientBalanceException(FinanceException):
         self.available = available
 
 class FinanceService:
-    def __init__(self, session: Session):
-        self.session = session
+    def __init__(self, session: Optional[PyMySQLAdapter] = None):
+        """
+        初始化 FinanceService
+        
+        Args:
+            session: 数据库会话适配器，如果为 None 则自动创建
+        """
+        self.session = session or PyMySQLAdapter()
 
     def _check_pool_balance(self, account_type: str, required_amount: Decimal) -> bool:
         balance = self.get_account_balance(account_type)
@@ -55,14 +61,15 @@ class FinanceService:
 
     def check_purchase_limit(self, user_id: int) -> bool:
         result = self.session.execute(
-            text("SELECT COUNT(*) as count FROM orders WHERE user_id = :user_id AND is_member_order = 1 AND created_at >= NOW() - INTERVAL 24 HOUR AND status != 'refunded'"),
+            "SELECT COUNT(*) as count FROM orders WHERE user_id = %s AND is_member_order = 1 AND created_at >= NOW() - INTERVAL 24 HOUR AND status != 'refunded'",
             {"user_id": user_id}
         )
-        return result.fetchone().count < MAX_PURCHASE_PER_DAY
+        row = result.fetchone()
+        return row.count < MAX_PURCHASE_PER_DAY if row else False
 
     def get_account_balance(self, account_type: str) -> Decimal:
         result = self.session.execute(
-            text("SELECT balance FROM finance_accounts WHERE account_type = :type"),
+            "SELECT balance FROM finance_accounts WHERE account_type = %s",
             {"type": account_type}
         )
         row = result.fetchone()
@@ -70,7 +77,7 @@ class FinanceService:
 
     def get_user_balance(self, user_id: int, balance_type: str = 'promotion_balance') -> Decimal:
         result = self.session.execute(
-            text(f"SELECT {balance_type} FROM users WHERE id = :user_id"),
+            f"SELECT {balance_type} FROM users WHERE id = %s",
             {"user_id": user_id}
         )
         row = result.fetchone()
@@ -81,7 +88,7 @@ class FinanceService:
         try:
             with self.session.begin():
                 result = self.session.execute(
-                    text("SELECT price, is_member_product, merchant_id FROM products WHERE id = :product_id AND status = 1 FOR UPDATE"),
+                    "SELECT price, is_member_product, merchant_id FROM products WHERE id = %s AND status = 1 FOR UPDATE",
                     {"product_id": product_id}
                 )
                 product = result.fetchone()
@@ -91,7 +98,7 @@ class FinanceService:
                 merchant_id = product.merchant_id
                 if merchant_id != PLATFORM_MERCHANT_ID:
                     result = self.session.execute(
-                        text("SELECT id FROM users WHERE id = :merchant_id"),
+                        "SELECT id FROM users WHERE id = %s",
                         {"merchant_id": merchant_id}
                     )
                     if not result.fetchone():
@@ -104,7 +111,7 @@ class FinanceService:
                 original_amount = unit_price * quantity
 
                 result = self.session.execute(
-                    text("SELECT member_level, points FROM users WHERE id = :user_id FOR UPDATE"),
+                    "SELECT member_level, points FROM users WHERE id = %s FOR UPDATE",
                     {"user_id": user_id}
                 )
                 user = result.fetchone()
@@ -145,11 +152,11 @@ class FinanceService:
             raise OrderException(f"积分抵扣不能超过订单金额的50%（最多{int(max_discount)}分）")
 
         self.session.execute(
-            text("UPDATE users SET points = points - :points WHERE id = :user_id"),
+            "UPDATE users SET points = points - %s WHERE id = %s",
             {"points": points_to_use, "user_id": user_id}
         )
         self.session.execute(
-            text("UPDATE finance_accounts SET balance = balance + :points WHERE account_type = 'company_points'"),
+            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
             {"points": points_to_use}
         )
 
@@ -157,8 +164,8 @@ class FinanceService:
                       product_id: int, total_amount: Decimal, original_amount: Decimal,
                       points_discount: Decimal, is_member: bool) -> int:
         result = self.session.execute(
-            text("""INSERT INTO orders (order_no, user_id, merchant_id, total_amount, original_amount, points_discount, is_member_order, status)
-                    VALUES (:order_no, :user_id, :merchant_id, :total_amount, :original_amount, :points_discount, :is_member, 'completed')"""),
+            """INSERT INTO orders (order_no, order_number, user_id, merchant_id, total_amount, original_amount, points_discount, is_member_order, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'completed')""",
             {
                 "order_no": order_no, "user_id": user_id, "merchant_id": merchant_id,
                 "total_amount": total_amount, "original_amount": original_amount,
@@ -168,8 +175,8 @@ class FinanceService:
         order_id = result.lastrowid
 
         self.session.execute(
-            text("""INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
-                    VALUES (:order_id, :product_id, 1, :unit_price, :total_price)"""),
+            """INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
+                    VALUES (%s, %s, 1, %s, %s)""",
             {
                 "order_id": order_id,
                 "product_id": product_id,
@@ -188,17 +195,17 @@ class FinanceService:
         new_level = min(old_level + quantity, 6)
 
         self.session.execute(
-            text("UPDATE users SET member_level = :level, level_changed_at = NOW() WHERE id = :user_id"),
+            "UPDATE users SET member_level = %s, level_changed_at = NOW() WHERE id = %s",
             {"level": new_level, "user_id": user_id}
         )
 
         points_earned = int(unit_price * quantity)
         self.session.execute(
-            text("UPDATE users SET points = points + :points WHERE id = :user_id"),
+            "UPDATE users SET points = points + %s WHERE id = %s",
             {"points": points_earned, "user_id": user_id}
         )
         result = self.session.execute(
-            text("SELECT points FROM users WHERE id = :user_id"),
+            "SELECT points FROM users WHERE id = %s",
             {"user_id": user_id}
         )
         new_points = result.fetchone().points
@@ -233,15 +240,15 @@ class FinanceService:
     def _create_pending_rewards(self, order_id: int, buyer_id: int, old_level: int, new_level: int) -> None:
         if old_level == 0:
             result = self.session.execute(
-                text("SELECT referrer_id FROM user_referrals WHERE user_id = :user_id"),
+                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
                 {"user_id": buyer_id}
             )
             referrer = result.fetchone()
             if referrer and referrer.referrer_id:
                 reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
                 self.session.execute(
-                    text("""INSERT INTO pending_rewards (user_id, reward_type, amount, order_id, status)
-                            VALUES (:user_id, 'referral', :amount, :order_id, 'pending')"""),
+                    """INSERT INTO pending_rewards (user_id, reward_type, amount, order_id, status)
+                       VALUES (%s, 'referral', %s, %s, 'pending')""",
                     {
                         "user_id": referrer.referrer_id,
                         "amount": reward_amount,
@@ -260,7 +267,7 @@ class FinanceService:
 
         for _ in range(target_layer):
             result = self.session.execute(
-                text("SELECT referrer_id FROM user_referrals WHERE user_id = :user_id"),
+                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
                 {"user_id": current_id}
             )
             ref = result.fetchone()
@@ -271,7 +278,7 @@ class FinanceService:
 
         if target_referrer:
             result = self.session.execute(
-                text("SELECT member_level FROM users WHERE id = :user_id"),
+                "SELECT member_level FROM users WHERE id = %s",
                 {"user_id": target_referrer}
             )
             referrer_level = result.fetchone().member_level
@@ -279,8 +286,8 @@ class FinanceService:
             if referrer_level >= target_layer:
                 reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
                 self.session.execute(
-                    text("""INSERT INTO pending_rewards (user_id, reward_type, amount, order_id, layer, status)
-                            VALUES (:user_id, 'team', :amount, :order_id, :layer, 'pending')"""),
+                    """INSERT INTO pending_rewards (user_id, reward_type, amount, order_id, layer, status)
+                       VALUES (%s, 'team', %s, %s, %s, 'pending')""",
                     {
                         "user_id": target_referrer,
                         "amount": reward_amount,
@@ -346,12 +353,12 @@ class FinanceService:
             if not reward_ids:
                 raise FinanceException("奖励ID列表不能为空")
 
-            placeholders = ','.join([f":id{i}" for i in range(len(reward_ids))])
+            placeholders = ','.join(['%s' for _ in range(len(reward_ids))])
             params = {f"id{i}": rid for i, rid in enumerate(reward_ids)}
 
             result = self.session.execute(
-                text(f"""SELECT id, user_id, reward_type, amount, order_id, layer
-                         FROM pending_rewards WHERE id IN ({placeholders}) AND status = 'pending'"""),
+                f"""SELECT id, user_id, reward_type, amount, order_id, layer
+                   FROM pending_rewards WHERE id IN ({placeholders}) AND status = 'pending'""",
                 params
             )
             rewards = result.fetchall()
@@ -365,8 +372,8 @@ class FinanceService:
 
                 for reward in rewards:
                     result = self.session.execute(
-                        text("""INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
-                                VALUES (:user_id, 'user', :amount, :valid_from, :valid_to, 'unused')"""),
+                        """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
+                           VALUES (%s, 'user', %s, %s, %s, 'unused')""",
                         {
                             "user_id": reward.user_id,
                             "amount": reward.amount,
@@ -377,7 +384,7 @@ class FinanceService:
                     coupon_id = result.lastrowid
 
                     self.session.execute(
-                        text("UPDATE pending_rewards SET status = 'approved' WHERE id = :id"),
+                        "UPDATE pending_rewards SET status = 'approved' WHERE id = %s",
                         {"id": reward.id}
                     )
 
@@ -392,7 +399,7 @@ class FinanceService:
                     logger.info(f"✅ 奖励{reward.id}已批准，发放优惠券{coupon_id}")
             else:
                 self.session.execute(
-                    text(f"UPDATE pending_rewards SET status = 'rejected' WHERE id IN ({placeholders})"),
+                    f"UPDATE pending_rewards SET status = 'rejected' WHERE id IN ({placeholders})",
                     params
                 )
                 logger.info(f"❌ 已拒绝 {len(reward_ids)} 条奖励")
@@ -407,17 +414,17 @@ class FinanceService:
 
     def get_rewards_by_status(self, status: str = 'pending', reward_type: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
         sql = """SELECT pr.id, pr.user_id, u.name as user_name, pr.reward_type, pr.amount, pr.order_id, pr.layer, pr.status, pr.created_at
-                 FROM pending_rewards pr JOIN users u ON pr.user_id = u.id WHERE pr.status = :status"""
+                 FROM pending_rewards pr JOIN users u ON pr.user_id = u.id WHERE pr.status = %s"""
         params = {"status": status}
 
         if reward_type:
-            sql += " AND pr.reward_type = :reward_type"
+            sql += " AND pr.reward_type = %s"
             params["reward_type"] = reward_type
 
-        sql += " ORDER BY pr.created_at DESC LIMIT :limit"
+        sql += " ORDER BY pr.created_at DESC LIMIT %s"
         params["limit"] = limit
 
-        result = self.session.execute(text(sql), params)
+        result = self.session.execute(sql, params)
         rewards = result.fetchall()
 
         return [{
@@ -436,7 +443,7 @@ class FinanceService:
         try:
             with self.session.begin():
                 result = self.session.execute(
-                    text("SELECT * FROM orders WHERE order_no = :order_no FOR UPDATE"),
+                    "SELECT * FROM orders WHERE order_no = %s FOR UPDATE",
                     {"order_no": order_no}
                 )
                 order = result.fetchone()
@@ -453,37 +460,37 @@ class FinanceService:
 
                 if is_member:
                     result = self.session.execute(
-                        text("SELECT referrer_id FROM user_referrals WHERE user_id = :user_id"),
+                        "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
                         {"user_id": user_id}
                     )
                     referrer = result.fetchone()
                     if referrer and referrer.referrer_id:
                         reward_amount = Decimal(str(order.original_amount)) * Decimal('0.50')
                         self.session.execute(
-                            text("""UPDATE users SET promotion_balance = promotion_balance - :amount
-                                    WHERE id = :user_id AND promotion_balance >= :amount"""),
+                            """UPDATE users SET promotion_balance = promotion_balance - %s
+                               WHERE id = %s AND promotion_balance >= %s""",
                             {"amount": reward_amount, "user_id": referrer.referrer_id}
                         )
 
                     result = self.session.execute(
-                        text("SELECT user_id, reward_amount FROM team_rewards WHERE order_id = :order_id"),
+                        "SELECT user_id, reward_amount FROM team_rewards WHERE order_id = %s",
                         {"order_id": order.id}
                     )
                     rewards = result.fetchall()
                     for reward in rewards:
                         self.session.execute(
-                            text("""UPDATE users SET promotion_balance = promotion_balance - :amount
-                                    WHERE id = :user_id AND promotion_balance >= :amount"""),
+                            """UPDATE users SET promotion_balance = promotion_balance - %s
+                               WHERE id = %s AND promotion_balance >= %s""",
                             {"amount": reward.reward_amount, "user_id": reward.user_id}
                         )
 
                     user_points = int(order.original_amount)
                     self.session.execute(
-                        text("UPDATE users SET points = GREATEST(points - :points, 0) WHERE id = :user_id"),
+                        "UPDATE users SET points = GREATEST(points - %s, 0) WHERE id = %s",
                         {"points": user_points, "user_id": user_id}
                     )
                     self.session.execute(
-                        text("UPDATE users SET member_level = GREATEST(member_level - 1, 0) WHERE id = :user_id"),
+                        "UPDATE users SET member_level = GREATEST(member_level - 1, 0) WHERE id = %s",
                         {"user_id": user_id}
                     )
                     logger.info(f"⚠️ 用户{user_id}退款后降级")
@@ -500,12 +507,12 @@ class FinanceService:
                     else:
                         self._check_user_balance(merchant_id, merchant_amount, 'merchant_balance')
                         self.session.execute(
-                            text("UPDATE users SET merchant_balance = merchant_balance - :amount WHERE id = :merchant_id"),
+                            "UPDATE users SET merchant_balance = merchant_balance - %s WHERE id = %s",
                             {"amount": merchant_amount, "merchant_id": merchant_id}
                         )
 
                 self.session.execute(
-                    text("UPDATE orders SET refund_status = 'refunded', updated_at = NOW() WHERE id = :order_id"),
+                    "UPDATE orders SET refund_status = 'refunded', updated_at = NOW() WHERE id = %s",
                     {"order_id": order.id}
                 )
 
@@ -524,13 +531,13 @@ class FinanceService:
             logger.warning("❌ 补贴池余额不足")
             return False
 
-        result = self.session.execute(text("SELECT SUM(points) as total FROM users WHERE points > 0"))
+        result = self.session.execute("SELECT SUM(points) as total FROM users WHERE points > 0")
         user_points = Decimal(str(result.fetchone().total or 0))
 
-        result = self.session.execute(text("SELECT SUM(merchant_points) as total FROM users WHERE merchant_points > 0"))
+        result = self.session.execute("SELECT SUM(merchant_points) as total FROM users WHERE merchant_points > 0")
         merchant_points = Decimal(str(result.fetchone().total or 0))
 
-        result = self.session.execute(text("SELECT balance as total FROM finance_accounts WHERE account_type = 'company_points'"))
+        result = self.session.execute("SELECT balance as total FROM finance_accounts WHERE account_type = 'company_points'")
         company_points = Decimal(str(result.fetchone().total or 0))
 
         total_points = user_points + merchant_points + company_points
@@ -549,7 +556,7 @@ class FinanceService:
         today = datetime.now().date()
         valid_to = today + timedelta(days=COUPON_VALID_DAYS)
 
-        result = self.session.execute(text("SELECT id, points FROM users WHERE points > 0"))
+        result = self.session.execute("SELECT id, points FROM users WHERE points > 0")
         users = result.fetchall()
 
         try:
@@ -563,8 +570,8 @@ class FinanceService:
                         continue
 
                     result = self.session.execute(
-                        text("""INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
-                                VALUES (:user_id, 'user', :amount, :valid_from, :valid_to, 'unused')"""),
+                        """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
+                           VALUES (%s, 'user', %s, %s, %s, 'unused')""",
                         {
                             "user_id": user.id,
                             "amount": subsidy_amount,
@@ -575,13 +582,13 @@ class FinanceService:
                     coupon_id = result.lastrowid
 
                     self.session.execute(
-                        text("UPDATE users SET points = points - :points WHERE id = :user_id"),
+                        "UPDATE users SET points = points - %s WHERE id = %s",
                         {"points": deduct_points, "user_id": user.id}
                     )
 
                     self.session.execute(
-                        text("""INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
-                                VALUES (:user_id, :week_start, :subsidy_amount, :points_before, :points_deducted, :coupon_id)"""),
+                        """INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
                         {
                             "user_id": user.id,
                             "week_start": today,
@@ -595,7 +602,7 @@ class FinanceService:
                     total_distributed += subsidy_amount
                     logger.info(f"用户{user.id}: 优惠券¥{subsidy_amount:.2f}, 扣积分{deduct_points}")
 
-                result = self.session.execute(text("SELECT id, merchant_points FROM users WHERE merchant_points > 0"))
+                result = self.session.execute("SELECT id, merchant_points FROM users WHERE merchant_points > 0")
                 merchants = result.fetchall()
 
                 for merchant in merchants:
@@ -607,8 +614,8 @@ class FinanceService:
                         continue
 
                     self.session.execute(
-                        text("""INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
-                                VALUES (:user_id, :week_start, :subsidy_amount, :points_before, :points_deducted, :coupon_id)"""),
+                        """INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
                         {
                             "user_id": merchant.id,
                             "week_start": today,
@@ -643,8 +650,8 @@ class FinanceService:
             status = 'pending_manual' if amount_decimal > 5000 else 'pending_auto'
 
             result = self.session.execute(
-                text("""INSERT INTO withdrawals (user_id, amount, tax_amount, actual_amount, status)
-                        VALUES (:user_id, :amount, :tax_amount, :actual_amount, :status)"""),
+                """INSERT INTO withdrawals (user_id, amount, tax_amount, actual_amount, status)
+                   VALUES (%s, %s, %s, %s, %s)""",
                 {
                     "user_id": user_id,
                     "amount": amount_decimal,
@@ -656,7 +663,7 @@ class FinanceService:
             withdrawal_id = result.lastrowid
 
             self.session.execute(
-                text(f"UPDATE users SET {balance_field} = {balance_field} - :amount WHERE id = :user_id"),
+                f"UPDATE users SET {balance_field} = {balance_field} - %s WHERE id = %s",
                 {"amount": amount_decimal, "user_id": user_id}
             )
 
@@ -669,7 +676,7 @@ class FinanceService:
             )
 
             self.session.execute(
-                text("UPDATE finance_accounts SET balance = balance + :amount WHERE account_type = 'company_balance'"),
+                "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_balance'",
                 {"amount": tax_amount}
             )
 
@@ -693,7 +700,7 @@ class FinanceService:
     def audit_withdrawal(self, withdrawal_id: int, approve: bool, auditor: str = 'admin') -> bool:
         try:
             result = self.session.execute(
-                text("SELECT * FROM withdrawals WHERE id = :withdrawal_id FOR UPDATE"),
+                "SELECT * FROM withdrawals WHERE id = %s FOR UPDATE",
                 {"withdrawal_id": withdrawal_id}
             )
             withdraw = result.fetchone()
@@ -703,8 +710,8 @@ class FinanceService:
 
             new_status = 'approved' if approve else 'rejected'
             self.session.execute(
-                text("""UPDATE withdrawals SET status = :status, audit_remark = :remark, processed_at = NOW()
-                        WHERE id = :withdrawal_id"""),
+                """UPDATE withdrawals SET status = %s, audit_remark = %s, processed_at = NOW()
+                   WHERE id = %s""",
                 {
                     "status": new_status,
                     "remark": f"{auditor}审核",
@@ -724,7 +731,7 @@ class FinanceService:
             else:
                 balance_field = 'promotion_balance' if withdraw.withdrawal_type == 'user' else 'merchant_balance'
                 self.session.execute(
-                    text(f"UPDATE users SET {balance_field} = {balance_field} + :amount WHERE id = :user_id"),
+                    f"UPDATE users SET {balance_field} = {balance_field} + %s WHERE id = %s",
                     {"amount": withdraw.amount, "user_id": withdraw.user_id}
                 )
 
@@ -763,8 +770,8 @@ class FinanceService:
         该函数应在事务上下文中调用（不负责提交/回滚）。"""
         balance_after = self._get_balance_after(account_type, related_user)
         self.session.execute(
-            text("""INSERT INTO account_flow (account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
-                    VALUES (:account_id, :account_type, :related_user, :change_amount, :balance_after, :flow_type, :remark, NOW())"""),
+            """INSERT INTO account_flow (account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""",
             {
                 "account_id": account_id,
                 "account_type": account_type,
@@ -780,11 +787,11 @@ class FinanceService:
         """对平台/池子类账户 (`finance_accounts`) 增减余额并记录流水。
         返回更新后的余额（Decimal）。"""
         self.session.execute(
-            text("UPDATE finance_accounts SET balance = balance + :amount WHERE account_type = :type"),
+            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
             {"amount": amount, "type": account_type}
         )
         result = self.session.execute(
-            text("SELECT balance FROM finance_accounts WHERE account_type = :type"),
+            "SELECT balance FROM finance_accounts WHERE account_type = %s",
             {"type": account_type}
         )
         row = result.fetchone()
@@ -801,8 +808,8 @@ class FinanceService:
     def _insert_points_log(self, user_id: int, change_amount: int, balance_after: int, type: str, reason: str, related_order: Optional[int] = None) -> None:
         """插入 `points_log` 记录。change_amount 使用整数（分/积分）。"""
         self.session.execute(
-            text("""INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
-                    VALUES (:user_id, :change, :balance, :type, :reason, :related_order, NOW())"""),
+            """INSERT INTO points_log (user_id, change_amount, balance_after, points_type, reason, related_order, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
             {
                 "user_id": user_id,
                 "change": change_amount,
@@ -818,11 +825,11 @@ class FinanceService:
         注意：`field` 必须是受信任的字段名（由调用处保证）。"""
         # 使用字符串插值构造字段位置（确保调用方只传入受控字段名）
         self.session.execute(
-            text(f"UPDATE users SET {field} = {field} + :delta WHERE id = :user_id"),
+            f"UPDATE users SET {field} = {field} + %s WHERE id = %s",
             {"delta": delta, "user_id": user_id}
         )
         result = self.session.execute(
-            text(f"SELECT {field} FROM users WHERE id = :user_id"),
+            f"SELECT {field} FROM users WHERE id = %s",
             {"user_id": user_id}
         )
         row = result.fetchone()
@@ -832,7 +839,7 @@ class FinanceService:
         if related_user and account_type in ['promotion_balance', 'merchant_balance']:
             field = account_type
             result = self.session.execute(
-                text(f"SELECT {field} FROM users WHERE id = :user_id"),
+                f"SELECT {field} FROM users WHERE id = %s",
                 {"user_id": related_user}
             )
             row = result.fetchone()
@@ -845,9 +852,9 @@ class FinanceService:
 
     def get_public_welfare_flow(self, limit: int = 50) -> List[Dict[str, Any]]:
         result = self.session.execute(
-            text("""SELECT id, related_user, change_amount, balance_after, flow_type, remark, created_at
-                    FROM account_flow WHERE account_type = 'public_welfare'
-                    ORDER BY created_at DESC LIMIT :limit"""),
+            """SELECT id, related_user, change_amount, balance_after, flow_type, remark, created_at
+               FROM account_flow WHERE account_type = 'public_welfare'
+               ORDER BY created_at DESC LIMIT %s""",
             {"limit": limit}
         )
         flows = result.fetchall()
@@ -864,20 +871,20 @@ class FinanceService:
 
     def get_public_welfare_report(self, start_date: str, end_date: str) -> Dict[str, Any]:
         result = self.session.execute(
-            text("""SELECT COUNT(*) as total_transactions,
-                           SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
-                           SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense
-                    FROM account_flow WHERE account_type = 'public_welfare'
-                    AND DATE(created_at) BETWEEN :start_date AND :end_date"""),
+            """SELECT COUNT(*) as total_transactions,
+                      SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
+                      SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense
+               FROM account_flow WHERE account_type = 'public_welfare'
+               AND DATE(created_at) BETWEEN %s AND %s""",
             {"start_date": start_date, "end_date": end_date}
         )
         summary = result.fetchone()
 
         result = self.session.execute(
-            text("""SELECT id, related_user, change_amount, balance_after, flow_type, remark, created_at
-                    FROM account_flow WHERE account_type = 'public_welfare'
-                    AND DATE(created_at) BETWEEN :start_date AND :end_date
-                    ORDER BY created_at DESC"""),
+            """SELECT id, related_user, change_amount, balance_after, flow_type, remark, created_at
+               FROM account_flow WHERE account_type = 'public_welfare'
+               AND DATE(created_at) BETWEEN %s AND %s
+               ORDER BY created_at DESC""",
             {"start_date": start_date, "end_date": end_date}
         )
         details = result.fetchall()
@@ -903,7 +910,7 @@ class FinanceService:
     def set_referrer(self, user_id: int, referrer_id: int) -> bool:
         try:
             result = self.session.execute(
-                text("SELECT member_level FROM users WHERE id = :referrer_id"),
+                "SELECT member_level FROM users WHERE id = %s",
                 {"referrer_id": referrer_id}
             )
             referrer = result.fetchone()
@@ -914,14 +921,14 @@ class FinanceService:
                 raise FinanceException("不能设置自己为推荐人")
 
             result = self.session.execute(
-                text("SELECT referrer_id FROM user_referrals WHERE user_id = :user_id"),
+                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
                 {"user_id": user_id}
             )
             if result.fetchone():
                 raise FinanceException("用户已存在推荐人，无法重复设置")
 
             self.session.execute(
-                text("INSERT INTO user_referrals (user_id, referrer_id) VALUES (:user_id, :referrer_id)"),
+                "INSERT INTO user_referrals (user_id, referrer_id) VALUES (%s, %s)",
                 {"user_id": user_id, "referrer_id": referrer_id}
             )
 
@@ -936,9 +943,9 @@ class FinanceService:
 
     def get_user_referrer(self, user_id: int) -> Optional[Dict[str, Any]]:
         result = self.session.execute(
-            text("""SELECT ur.referrer_id, u.name, u.member_level
-                    FROM user_referrals ur JOIN users u ON ur.referrer_id = u.id
-                    WHERE ur.user_id = :user_id"""),
+            """SELECT ur.referrer_id, u.name, u.member_level
+               FROM user_referrals ur JOIN users u ON ur.referrer_id = u.id
+               WHERE ur.user_id = %s""",
             {"user_id": user_id}
         )
         row = result.fetchone()
@@ -950,16 +957,16 @@ class FinanceService:
 
     def get_user_team(self, user_id: int, max_layer: int = MAX_TEAM_LAYER) -> List[Dict[str, Any]]:
         result = self.session.execute(
-            text("""WITH RECURSIVE team_tree AS (
-                        SELECT user_id, referrer_id, 1 as layer FROM user_referrals WHERE referrer_id = :user_id
-                        UNION ALL
-                        SELECT ur.user_id, ur.referrer_id, tt.layer + 1
-                        FROM user_referrals ur JOIN team_tree tt ON ur.referrer_id = tt.user_id
-                        WHERE tt.layer < :max_layer
-                    )
-                    SELECT tt.user_id, u.name, u.member_level, tt.layer
-                    FROM team_tree tt JOIN users u ON tt.user_id = u.id
-                    ORDER BY tt.layer, tt.user_id"""),
+            """WITH RECURSIVE team_tree AS (
+               SELECT user_id, referrer_id, 1 as layer FROM user_referrals WHERE referrer_id = %s
+               UNION ALL
+               SELECT ur.user_id, ur.referrer_id, tt.layer + 1
+               FROM user_referrals ur JOIN team_tree tt ON ur.referrer_id = tt.user_id
+               WHERE tt.layer < %s
+               )
+               SELECT tt.user_id, u.name, u.member_level, tt.layer
+               FROM team_tree tt JOIN users u ON tt.user_id = u.id
+               ORDER BY tt.layer, tt.user_id""",
             {"user_id": user_id, "max_layer": max_layer}
         )
         return [{
@@ -973,7 +980,7 @@ class FinanceService:
         try:
             logger.info("\n👑 荣誉董事晋升审核")
 
-            result = self.session.execute(text("SELECT id FROM users WHERE member_level = 6"))
+            result = self.session.execute("SELECT id FROM users WHERE member_level = 6")
             six_star_users = result.fetchall()
 
             promoted_count = 0
@@ -981,31 +988,31 @@ class FinanceService:
                 user_id = user.id
 
                 result = self.session.execute(
-                    text("""SELECT COUNT(DISTINCT u.id) as count
-                            FROM user_referrals ur JOIN users u ON ur.user_id = u.id
-                            WHERE ur.referrer_id = :user_id AND u.member_level = 6"""),
+                    """SELECT COUNT(DISTINCT u.id) as count
+                       FROM user_referrals ur JOIN users u ON ur.user_id = u.id
+                       WHERE ur.referrer_id = %s AND u.member_level = 6""",
                     {"user_id": user_id}
                 )
                 direct_count = result.fetchone().count
 
                 result = self.session.execute(
-                    text("""WITH RECURSIVE team AS (
-                                SELECT user_id, referrer_id, 1 as level FROM user_referrals WHERE referrer_id = :user_id
-                                UNION ALL
-                                SELECT ur.user_id, ur.referrer_id, t.level + 1
-                                FROM user_referrals ur JOIN team t ON ur.referrer_id = t.user_id
-                                WHERE t.level < 6
-                            )
-                            SELECT COUNT(DISTINCT t.user_id) as count
-                            FROM team t JOIN users u ON t.user_id = u.id
-                            WHERE u.member_level = 6"""),
+                    """WITH RECURSIVE team AS (
+                       SELECT user_id, referrer_id, 1 as level FROM user_referrals WHERE referrer_id = %s
+                       UNION ALL
+                       SELECT ur.user_id, ur.referrer_id, t.level + 1
+                       FROM user_referrals ur JOIN team t ON ur.referrer_id = t.user_id
+                       WHERE t.level < 6
+                       )
+                       SELECT COUNT(DISTINCT t.user_id) as count
+                       FROM team t JOIN users u ON t.user_id = u.id
+                       WHERE u.member_level = 6""",
                     {"user_id": user_id}
                 )
                 total_count = result.fetchone().count
 
                 if direct_count >= 3 and total_count >= 10:
                     result = self.session.execute(
-                        text("UPDATE users SET status = 9 WHERE id = :user_id AND status != 9"),
+                        "UPDATE users SET status = 9 WHERE id = %s AND status != 9",
                         {"user_id": user_id}
                     )
                     if result.rowcount > 0:
@@ -1023,9 +1030,9 @@ class FinanceService:
 
     def get_user_info(self, user_id: int) -> Dict[str, Any]:
         result = self.session.execute(
-            text("""SELECT id, mobile, name, member_level, points, promotion_balance,
-                           merchant_points, merchant_balance, status
-                    FROM users WHERE id = :user_id"""),
+            """SELECT id, mobile, name, member_level, points, promotion_balance,
+               merchant_points, merchant_balance, status
+               FROM users WHERE id = %s""",
             {"user_id": user_id}
         )
         user = result.fetchone()
@@ -1042,8 +1049,8 @@ class FinanceService:
         star_level = "荣誉董事" if user.status == 9 else (f"{user.member_level}星级会员" if user.member_level > 0 else "非会员")
 
         result = self.session.execute(
-            text("""SELECT COUNT(*) as count, SUM(amount) as total_amount
-                    FROM coupons WHERE user_id = :user_id AND status = 'unused'"""),
+            """SELECT COUNT(*) as count, SUM(amount) as total_amount
+               FROM coupons WHERE user_id = %s AND status = 'unused'""",
             {"user_id": user_id}
         )
         coupons = result.fetchone()
@@ -1068,9 +1075,9 @@ class FinanceService:
 
     def get_user_coupons(self, user_id: int, status: str = 'unused') -> List[Dict[str, Any]]:
         result = self.session.execute(
-            text("""SELECT id, coupon_type, amount, status, valid_from, valid_to, used_at, created_at
-                    FROM coupons WHERE user_id = :user_id AND status = :status
-                    ORDER BY created_at DESC"""),
+            """SELECT id, coupon_type, amount, status, valid_from, valid_to, used_at, created_at
+               FROM coupons WHERE user_id = %s AND status = %s
+               ORDER BY created_at DESC""",
             {"user_id": user_id, "status": status}
         )
         coupons = result.fetchall()
@@ -1087,20 +1094,20 @@ class FinanceService:
         } for c in coupons]
 
     def get_finance_report(self) -> Dict[str, Any]:
-        result = self.session.execute(text("""SELECT SUM(points) as points, SUM(promotion_balance) as balance FROM users"""))
+        result = self.session.execute("""SELECT SUM(points) as points, SUM(promotion_balance) as balance FROM users""")
         user = result.fetchone()
 
-        result = self.session.execute(text("""SELECT SUM(merchant_points) as points, SUM(merchant_balance) as balance
-                                              FROM users WHERE merchant_points > 0 OR merchant_balance > 0"""))
+        result = self.session.execute("""SELECT SUM(merchant_points) as points, SUM(merchant_balance) as balance
+                                         FROM users WHERE merchant_points > 0 OR merchant_balance > 0""")
         merchant = result.fetchone()
 
-        result = self.session.execute(text("SELECT account_name, account_type, balance FROM finance_accounts"))
+        result = self.session.execute("SELECT account_name, account_type, balance FROM finance_accounts")
         pools = result.fetchall()
 
         public_welfare_balance = self.get_public_welfare_balance()
 
-        result = self.session.execute(text("""SELECT COUNT(*) as count, SUM(amount) as total_amount
-                                              FROM coupons WHERE status = 'unused'"""))
+        result = self.session.execute("""SELECT COUNT(*) as count, SUM(amount) as total_amount
+                                         FROM coupons WHERE status = 'unused'""")
         coupons = result.fetchone()
 
         platform_pools = []
@@ -1139,8 +1146,8 @@ class FinanceService:
 
     def get_account_flow_report(self, limit: int = 50) -> List[Dict[str, Any]]:
         result = self.session.execute(
-            text("""SELECT id, account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at
-                    FROM account_flow ORDER BY created_at DESC LIMIT :limit"""),
+            """SELECT id, account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at
+               FROM account_flow ORDER BY created_at DESC LIMIT %s""",
             {"limit": limit}
         )
         flows = result.fetchall()
@@ -1163,12 +1170,12 @@ class FinanceService:
                  FROM points_log"""
 
         if user_id:
-            sql += " WHERE user_id = :user_id"
+            sql += " WHERE user_id = %s"
             params["user_id"] = user_id
 
-        sql += " ORDER BY created_at DESC LIMIT :limit"
+        sql += " ORDER BY created_at DESC LIMIT %s"
 
-        result = self.session.execute(text(sql), params)
+        result = self.session.execute(sql, params)
         flows = result.fetchall()
 
         return [{
@@ -1185,21 +1192,22 @@ class FinanceService:
     def get_points_deduction_report(self, start_date: str, end_date: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         offset = (page - 1) * page_size
         result = self.session.execute(
-            text("""SELECT COUNT(*) as total
-                    FROM orders o JOIN points_log pl ON o.id = pl.related_order
-                    WHERE o.points_discount > 0 AND pl.type = 'member' AND pl.reason = '积分抵扣支付'
-                    AND DATE(o.created_at) BETWEEN :start_date AND :end_date"""),
+            """SELECT COUNT(*) as total
+               FROM orders o JOIN points_log pl ON o.id = pl.related_order
+               WHERE o.points_discount > 0 AND pl.points_type = 'member' AND pl.reason = '积分抵扣支付'
+               AND DATE(o.created_at) BETWEEN %s AND %s""",
             {"start_date": start_date, "end_date": end_date}
         )
-        total_count = result.fetchone().total
+        row = result.fetchone()
+        total_count = row.total if row else 0
 
         result = self.session.execute(
-            text("""SELECT o.id as order_id, o.order_no, o.user_id, u.name as user_name, u.member_level,
-                           o.original_amount, o.points_discount, o.total_amount, ABS(pl.change_amount) as points_used, o.created_at
-                    FROM orders o JOIN points_log pl ON o.id = pl.related_order JOIN users u ON o.user_id = u.id
-                    WHERE o.points_discount > 0 AND pl.type = 'member' AND pl.reason = '积分抵扣支付'
-                    AND DATE(o.created_at) BETWEEN :start_date AND :end_date
-                    ORDER BY o.created_at DESC LIMIT :page_size OFFSET :offset"""),
+            """SELECT o.id as order_id, o.order_no, o.user_id, u.name as user_name, u.member_level,
+                      o.original_amount, o.points_discount, o.total_amount, ABS(pl.change_amount) as points_used, o.created_at
+               FROM orders o JOIN points_log pl ON o.id = pl.related_order JOIN users u ON o.user_id = u.id
+               WHERE o.points_discount > 0 AND pl.points_type = 'member' AND pl.reason = '积分抵扣支付'
+               AND DATE(o.created_at) BETWEEN %s AND %s
+               ORDER BY o.created_at DESC LIMIT %s OFFSET %s""",
             {
                 "start_date": start_date,
                 "end_date": end_date,
@@ -1210,11 +1218,11 @@ class FinanceService:
         records = result.fetchall()
 
         result = self.session.execute(
-            text("""SELECT COUNT(*) as total_orders, SUM(ABS(pl.change_amount)) as total_points,
-                           SUM(o.points_discount) as total_discount_amount
-                    FROM orders o JOIN points_log pl ON o.id = pl.related_order
-                    WHERE o.points_discount > 0 AND pl.type = 'member' AND pl.reason = '积分抵扣支付'
-                    AND DATE(o.created_at) BETWEEN :start_date AND :end_date"""),
+            """SELECT COUNT(*) as total_orders, SUM(ABS(pl.change_amount)) as total_points,
+                      SUM(o.points_discount) as total_discount_amount
+               FROM orders o JOIN points_log pl ON o.id = pl.related_order
+               WHERE o.points_discount > 0 AND pl.points_type = 'member' AND pl.reason = '积分抵扣支付'
+               AND DATE(o.created_at) BETWEEN %s AND %s""",
             {"start_date": start_date, "end_date": end_date}
         )
         summary = result.fetchone()
@@ -1248,15 +1256,15 @@ class FinanceService:
     def get_transaction_chain_report(self, user_id: int, order_no: Optional[str] = None) -> Dict[str, Any]:
         if order_no:
             result = self.session.execute(
-                text("""SELECT id, order_no, total_amount, original_amount, is_member_order
-                        FROM orders WHERE order_no = :order_no AND user_id = :user_id"""),
+                """SELECT id, order_no, total_amount, original_amount, is_member_order
+                   FROM orders WHERE order_no = %s AND user_id = %s""",
                 {"order_no": order_no, "user_id": user_id}
             )
         else:
             result = self.session.execute(
-                text("""SELECT id, order_no, total_amount, original_amount, is_member_order
-                        FROM orders WHERE user_id = :user_id
-                        ORDER BY created_at DESC LIMIT 1"""),
+                """SELECT id, order_no, total_amount, original_amount, is_member_order
+                   FROM orders WHERE user_id = %s
+                   ORDER BY created_at DESC LIMIT 1""",
                 {"user_id": user_id}
             )
 
@@ -1270,9 +1278,9 @@ class FinanceService:
 
         while current_id and level < MAX_TEAM_LAYER:
             result = self.session.execute(
-                text("""SELECT u.id, u.name, u.member_level, ur.referrer_id
-                        FROM users u LEFT JOIN user_referrals ur ON u.id = ur.user_id
-                        WHERE u.id = :user_id"""),
+                """SELECT u.id, u.name, u.member_level, ur.referrer_id
+                   FROM users u LEFT JOIN user_referrals ur ON u.id = ur.user_id
+                   WHERE u.id = %s""",
                 {"user_id": current_id}
             )
             user_info = result.fetchone()
@@ -1283,8 +1291,8 @@ class FinanceService:
             level += 1
 
             result = self.session.execute(
-                text("""SELECT reward_amount, created_at FROM team_rewards
-                        WHERE order_id = :order_id AND layer = :layer"""),
+                """SELECT reward_amount, created_at FROM team_rewards
+                   WHERE order_id = %s AND layer = %s""",
                 {"order_id": order.id, "layer": level}
             )
             team_reward = result.fetchone()
@@ -1292,8 +1300,8 @@ class FinanceService:
             referral_reward = None
             if level == 1:
                 result = self.session.execute(
-                    text("""SELECT amount FROM pending_rewards
-                            WHERE order_id = :order_id AND reward_type = 'referral' AND status = 'approved'"""),
+                    """SELECT amount FROM pending_rewards
+                       WHERE order_id = %s AND reward_type = 'referral' AND status = 'approved'""",
                     {"order_id": order.id}
                 )
                 ref_reward = result.fetchone()
@@ -1334,3 +1342,256 @@ class FinanceService:
             },
             "chain": chain
         }
+
+
+# ==================== 订单系统财务功能（来自 order/finance.py） ====================
+
+def split_order_funds(order_number: str, total: Decimal, is_vip: bool):
+    """订单分账：将订单金额分配给商家和各个资金池
+    
+    参数:
+        order_number: 订单号
+        total: 订单总金额
+        is_vip: 是否为会员订单
+    """
+    from config import get_conn
+    
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 商家分得 80%
+            merchant = total * Decimal("0.8")
+            cur.execute(
+                "INSERT INTO order_split(order_number,item_type,amount) VALUES(%s,'merchant',%s)",
+                (order_number, merchant)
+            )
+            
+            # 平台分得 20%，再分配到各个资金池
+            pool_total = total * Decimal("0.2")
+            pools = {
+                "public": 0.01,      # 公益基金
+                "maintain": 0.01,   # 平台维护
+                "subsidy": 0.12,    # 周补贴池
+                "director": 0.02,   # 荣誉董事分红
+                "shop": 0.01,       # 社区店
+                "city": 0.01,       # 城市运营中心
+                "branch": 0.005,    # 大区分公司
+                "fund": 0.015       # 事业发展基金
+            }
+            for k, v in pools.items():
+                amt = pool_total * Decimal(str(v))
+                cur.execute(
+                    "INSERT INTO order_split(order_number,item_type,amount,pool_type) VALUES(%s,'pool',%s,%s)",
+                    (order_number, amt, k)
+                )
+            conn.commit()
+
+
+def reverse_split_on_refund(order_number: str):
+    """退款回冲：撤销订单分账
+    
+    参数:
+        order_number: 订单号
+    """
+    from config import get_conn
+    
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 回冲商家余额
+            cur.execute(
+                "SELECT SUM(amount) AS m FROM order_split WHERE order_number=%s AND item_type='merchant'",
+                (order_number,)
+            )
+            m = cur.fetchone()["m"] or Decimal("0")
+            cur.execute(
+                "UPDATE merchant_balance SET balance=balance-%s WHERE merchant_id=1",
+                (m,)
+            )
+            # 注意：资金池回冲逻辑可根据实际需求实现
+            conn.commit()
+
+
+def get_balance(merchant_id: int = 1):
+    """获取商家余额信息
+    
+    参数:
+        merchant_id: 商家ID，默认为1
+        
+    返回:
+        dict: 包含 balance, bank_name, bank_account 的字典
+    """
+    from config import get_conn
+    
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT balance,bank_name,bank_account FROM merchant_balance WHERE merchant_id=%s",
+                (merchant_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                # 如果不存在，创建初始记录
+                cur.execute(
+                    "INSERT INTO merchant_balance(merchant_id,balance) VALUES(%s,0)",
+                    (merchant_id,)
+                )
+                conn.commit()
+                return {"balance": Decimal("0"), "bank_name": "", "bank_account": ""}
+            return row
+
+
+def bind_bank(bank_name: str, bank_account: str, merchant_id: int = 1):
+    """绑定商家银行信息
+    
+    参数:
+        bank_name: 银行名称
+        bank_account: 银行账号
+        merchant_id: 商家ID，默认为1
+    """
+    from config import get_conn
+    
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE merchant_balance SET bank_name=%s,bank_account=%s WHERE merchant_id=%s",
+                (bank_name, bank_account, merchant_id)
+            )
+            conn.commit()
+
+
+def withdraw(amount: Decimal, merchant_id: int = 1) -> bool:
+    """商家提现
+    
+    参数:
+        amount: 提现金额
+        merchant_id: 商家ID，默认为1
+        
+    返回:
+        bool: 提现是否成功
+    """
+    from config import get_conn
+    
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT balance FROM merchant_balance WHERE merchant_id=%s",
+                (merchant_id,)
+            )
+            bal = cur.fetchone()["balance"]
+            if bal < amount:
+                return False
+            cur.execute(
+                "UPDATE merchant_balance SET balance=balance-%s WHERE merchant_id=%s",
+                (amount, merchant_id)
+            )
+            conn.commit()
+            return True
+
+
+def settle_to_merchant(amount: Decimal, merchant_id: int = 1):
+    """结算给商家（订单完成后）
+    
+    参数:
+        amount: 结算金额
+        merchant_id: 商家ID，默认为1
+    """
+    from config import get_conn
+    
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE merchant_balance SET balance=balance+%s WHERE merchant_id=%s",
+                (amount, merchant_id)
+            )
+            conn.commit()
+
+
+def generate_statement():
+    """生成商家日账单"""
+    from config import get_conn
+    from datetime import date, timedelta
+    
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            yesterday = date.today() - timedelta(days=1)
+            
+            # 获取期初余额
+            cur.execute(
+                "SELECT closing_balance FROM merchant_statement WHERE merchant_id=1 AND date<%s ORDER BY date DESC LIMIT 1",
+                (yesterday,)
+            )
+            row = cur.fetchone()
+            opening = row["closing_balance"] if row else Decimal("0")
+            
+            # 获取当日收入
+            cur.execute(
+                "SELECT SUM(amount) AS income FROM order_split WHERE item_type='merchant' AND DATE(created_at)=%s",
+                (yesterday,)
+            )
+            income = cur.fetchone()["income"] or Decimal("0")
+            
+            # 当日提现（简化处理，实际应从提现表中查询）
+            withdraw_amount = Decimal("0")
+            
+            # 计算期末余额
+            closing = opening + income - withdraw_amount
+            
+            # 插入或更新账单
+            cur.execute(
+                """INSERT INTO merchant_statement(merchant_id,date,opening_balance,income,withdraw,closing_balance)
+                   VALUES(%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE
+                   opening_balance=VALUES(opening_balance),income=VALUES(income),withdraw=VALUES(withdraw),closing_balance=VALUES(closing_balance)""",
+                (1, yesterday, opening, income, withdraw_amount, closing)
+            )
+            conn.commit()
+
+
+# ==================== 商品管理相关功能（来自 product/finance_logic.py） ====================
+
+import math
+from pathlib import Path
+from PIL import Image
+from fastapi import HTTPException, UploadFile
+
+
+def save_image(file: UploadFile, folder: Path, max_size: tuple, max_mb: int, quality: int) -> str:
+    """保存图片文件
+    
+    参数:
+        file: 上传的文件对象
+        folder: 保存目录
+        max_size: 最大尺寸 (width, height)
+        max_mb: 最大文件大小（MB）
+        quality: JPEG 质量 (1-100)
+        
+    返回:
+        str: 图片URL路径
+    """
+    import uuid
+    ext = Path(file.filename).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
+    if file.size > max_mb * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"文件大小超过 {max_mb}MB")
+    file_name = f"{uuid.uuid4().hex}{ext}"
+    file_path = folder / file_name
+    with Image.open(file.file) as im:
+        im = im.convert("RGB")
+        im.thumbnail(max_size, Image.LANCZOS)
+        im.save(file_path, "JPEG", quality=quality, optimize=True)
+    return f"/pic/{folder.name}/{file_name}"
+
+
+def calc_max_points_per_item(unit_price_yuan: float, max_points_set: int) -> int:
+    """计算每个商品的最大可用积分
+    
+    参数:
+        unit_price_yuan: 商品单价（元）
+        max_points_set: 系统设置的最大积分值
+        
+    返回:
+        int: 最大可用积分数
+    """
+    if max_points_set <= 0:
+        return 0
+    fifty_percent_points = math.floor(unit_price_yuan * 0.5)
+    return min(max_points_set, fifty_percent_points)

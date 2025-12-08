@@ -6,27 +6,18 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 from decimal import Decimal
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Path
+from fastapi import FastAPI, HTTPException, Depends, Query, Path, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy.orm import Session
-from sqlalchemy import text
 
-from database_setup import get_db_session, DatabaseManager
+from config import get_conn
+from database_setup import DatabaseManager  # DatabaseManager 用于表结构初始化，需要 SQLAlchemy engine
 from .finance_logic import FinanceService, FinanceException, OrderException
-from config import PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE, MAX_TEAM_LAYER, LOG_DIR
+from config import PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE, MAX_TEAM_LAYER, LOG_FILE
 
-# 确保日志目录存在（使用与 finance_logic.py 相同的日志目录）
-log_file = os.path.join(LOG_DIR, 'api.log')
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_file, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+# 使用统一的日志文件路径 logs/api.log
+# 注意：如果 finance_logic.py 已经配置了日志，这里不会重复配置
+# 如果需要在多个模块中共享日志配置，应该使用 getLogger 而不是 basicConfig
 logger = logging.getLogger(__name__)
 
 
@@ -93,31 +84,21 @@ class RefundRequest(BaseModel):
     order_no: str
 
 
-app = FastAPI(
-    title="财务管理系统API",
-    description="星级会员升级 + 双重身份 + 公益基金账户 + 优惠券补贴财务系统API",
-    version="3.2.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 创建财务系统的路由
+router = APIRouter()
 
 
-def get_finance_service(session: Session = Depends(get_db_session)) -> FinanceService:
-    return FinanceService(session)
+def get_finance_service() -> FinanceService:
+    """获取 FinanceService 实例（使用统一的 pymysql 连接）"""
+    return FinanceService()
 
 
-@app.get("/", summary="系统状态")
+@router.get("/", summary="系统状态")
 async def root():
     return {"message": "财务管理系统API运行中", "version": "3.2.0"}
 
 
-@app.post("/api/init", response_model=ResponseModel, summary="初始化数据库")
+@router.post("/api/init", response_model=ResponseModel, summary="初始化数据库")
 async def init_database(db_manager: DatabaseManager = Depends()):
     try:
         from database_setup import get_engine
@@ -131,7 +112,7 @@ async def init_database(db_manager: DatabaseManager = Depends()):
         raise HTTPException(status_code=500, detail=f"初始化失败: {e}")
 
 
-@app.post("/api/init-data", response_model=ResponseModel, summary="创建测试数据")
+@router.post("/api/init-data", response_model=ResponseModel, summary="创建测试数据")
 async def create_test_data(db_manager: DatabaseManager = Depends()):
     try:
         from database_setup import get_engine
@@ -146,33 +127,34 @@ async def create_test_data(db_manager: DatabaseManager = Depends()):
         raise HTTPException(status_code=500, detail=f"创建失败: {e}")
 
 
-@app.post("/api/users", response_model=ResponseModel, summary="创建用户")
+@router.post("/api/users", response_model=ResponseModel, summary="创建用户")
 async def create_user(
         request: UserCreateRequest,
         service: FinanceService = Depends(get_finance_service)
 ):
     try:
-        result = service.session.execute(
-            text("INSERT INTO users (mobile, password_hash, name, status) VALUES (:mobile, :pwd, :name, 1)"),
-            {"mobile": request.mobile, "pwd": '$2b$12$KZmw2fKkA7TczqQ8s8tK7e', "name": request.name}
-        )
-        user_id = result.lastrowid
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (mobile, password_hash, name, status) VALUES (%s, %s, %s, 1)",
+                    (request.mobile, '$2b$12$KZmw2fKkA7TczqQ8s8tK7e', request.name)
+                )
+                user_id = cur.lastrowid
 
-        if request.referrer_id:
-            service.session.execute(
-                text("INSERT INTO user_referrals (user_id, referrer_id) VALUES (:user_id, :referrer_id)"),
-                {"user_id": user_id, "referrer_id": request.referrer_id}
-            )
+                if request.referrer_id:
+                    cur.execute(
+                        "INSERT INTO user_referrals (user_id, referrer_id) VALUES (%s, %s)",
+                        (user_id, request.referrer_id)
+                    )
 
-        service.session.commit()
+                conn.commit()
         return ResponseModel(success=True, message="用户创建成功", data={"user_id": user_id})
     except Exception as e:
-        service.session.rollback()
         logger.error(f"创建用户失败: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/users/{user_id}", response_model=ResponseModel, summary="查询用户信息")
+@router.get("/api/users/{user_id}", response_model=ResponseModel, summary="查询用户信息")
 async def get_user_info(
         user_id: int,
         service: FinanceService = Depends(get_finance_service)
@@ -187,7 +169,7 @@ async def get_user_info(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/users/set-referrer", response_model=ResponseModel, summary="设置推荐人")
+@router.post("/api/users/set-referrer", response_model=ResponseModel, summary="设置推荐人")
 async def set_user_referrer(
         service: FinanceService = Depends(get_finance_service),
         user_id: int = Query(..., gt=0, description="被推荐用户ID"),
@@ -203,7 +185,7 @@ async def set_user_referrer(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/users/{user_id}/referrer", response_model=ResponseModel, summary="查询推荐人")
+@router.get("/api/users/{user_id}/referrer", response_model=ResponseModel, summary="查询推荐人")
 async def get_user_referrer(
         user_id: int,
         service: FinanceService = Depends(get_finance_service)
@@ -218,7 +200,7 @@ async def get_user_referrer(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/users/{user_id}/team", response_model=ResponseModel, summary="查询团队下线")
+@router.get("/api/users/{user_id}/team", response_model=ResponseModel, summary="查询团队下线")
 async def get_user_team(
         service: FinanceService = Depends(get_finance_service),
         user_id: int = Path(..., gt=0),
@@ -232,7 +214,7 @@ async def get_user_team(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/products", response_model=ResponseModel, summary="创建商品")
+@router.post("/api/products", response_model=ResponseModel, summary="创建商品")
 async def create_product(
         product: ProductCreateRequest,
         service: FinanceService = Depends(get_finance_service)
@@ -244,7 +226,7 @@ async def create_product(
         else:
             # 普通商家发布的商品，检查商家是否存在
             result = service.session.execute(
-                text("SELECT id FROM users WHERE id = :merchant_id"),
+                "SELECT id FROM users WHERE id = %s",
                 {"merchant_id": product.merchant_id}
             )
             if not result.fetchone():
@@ -259,8 +241,8 @@ async def create_product(
         # 生成 SKU 并创建商品
         sku = f"SKU{int(datetime.now().timestamp())}"
         result = service.session.execute(
-            text("""INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
-                    VALUES (:sku, :name, :price, :stock, :is_member, :merchant_id, 1)"""),
+            """INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
+               VALUES (%s, %s, %s, %s, %s, %s, 1)""",
             {
                 "sku": sku,
                 "name": product.name,
@@ -280,7 +262,7 @@ async def create_product(
         raise HTTPException(status_code=400, detail=f"创建失败: {e}")
 
 
-@app.get("/api/products", response_model=ResponseModel, summary="查询商品列表")
+@router.get("/api/products", response_model=ResponseModel, summary="查询商品列表")
 async def get_products(
         service: FinanceService = Depends(get_finance_service),
         is_member: Optional[int] = Query(None, ge=0, le=1)
@@ -292,7 +274,7 @@ async def get_products(
             sql += " AND is_member_product = :is_member"
             params["is_member"] = is_member
 
-        result = service.session.execute(text(sql), params)
+        result = service.session.execute(sql, params)
         products = result.fetchall()
 
         return ResponseModel(success=True, message="查询成功", data={
@@ -311,7 +293,7 @@ async def get_products(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/orders", response_model=ResponseModel, summary="订单结算")
+@router.post("/api/orders", response_model=ResponseModel, summary="订单结算")
 async def settle_order(
         order: OrderRequest,
         service: FinanceService = Depends(get_finance_service)
@@ -326,7 +308,7 @@ async def settle_order(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/orders/refund", response_model=ResponseModel, summary="订单退款")
+@router.post("/api/orders/refund", response_model=ResponseModel, summary="订单退款")
 async def refund_order(
         request: RefundRequest,
         service: FinanceService = Depends(get_finance_service)
@@ -341,31 +323,34 @@ async def refund_order(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/orders/use-coupon", response_model=ResponseModel, summary="使用优惠券")
+@router.post("/api/orders/use-coupon", response_model=ResponseModel, summary="使用优惠券")
 async def use_coupon(
         request: CouponUseRequest,
         service: FinanceService = Depends(get_finance_service)
 ):
     try:
-        with service.session.begin():
-            result = service.session.execute(
-                text("""SELECT * FROM coupons 
-                        WHERE id = :coupon_id AND user_id = :user_id AND status = 'unused'
-                        AND valid_from <= CURDATE() AND valid_to >= CURDATE()"""),
-                {"coupon_id": request.coupon_id, "user_id": request.user_id}
-            )
-            coupon = result.fetchone()
+        from config import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT * FROM coupons 
+                       WHERE id = %s AND user_id = %s AND status = 'unused'
+                       AND valid_from <= CURDATE() AND valid_to >= CURDATE()""",
+                    (request.coupon_id, request.user_id)
+                )
+                coupon = cur.fetchone()
 
-            if not coupon:
-                raise HTTPException(status_code=400, detail="优惠券无效或已过期")
+                if not coupon:
+                    raise HTTPException(status_code=400, detail="优惠券无效或已过期")
 
-            discount_amount = Decimal(str(coupon.amount))
-            final_amount = max(Decimal('0.00'), Decimal(str(request.order_amount)) - discount_amount)
+                discount_amount = Decimal(str(coupon['amount']))
+                final_amount = max(Decimal('0.00'), Decimal(str(request.order_amount)) - discount_amount)
 
-            service.session.execute(
-                text("UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = :coupon_id"),
-                {"coupon_id": request.coupon_id}
-            )
+                cur.execute(
+                    "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s",
+                    (request.coupon_id,)
+                )
+                conn.commit()
 
         return ResponseModel(
             success=True,
@@ -379,7 +364,7 @@ async def use_coupon(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/submit-test-order", response_model=ResponseModel, summary="提交测试订单")
+@router.post("/api/submit-test-order", response_model=ResponseModel, summary="提交测试订单")
 async def submit_test_order(
         service: FinanceService = Depends(get_finance_service),
         user_id: int = Query(..., gt=0, description="用户ID"),
@@ -391,8 +376,7 @@ async def submit_test_order(
         is_member = 1 if product_type == "member" else 0
 
         result = service.session.execute(
-            text(
-                """SELECT id, price, name FROM products WHERE is_member_product = :is_member AND status = 1 LIMIT 1"""),
+                """SELECT id, price, name FROM products WHERE is_member_product = %s AND status = 1 LIMIT 1""",
             {"is_member": is_member}
         )
         product = result.fetchone()
@@ -401,8 +385,8 @@ async def submit_test_order(
             if product_type == "member":
                 sku = f"SKU-M-{int(datetime.now().timestamp())}"
                 result = service.session.execute(
-                    text("""INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
-                            VALUES (:sku, :name, :price, 100, 1, :merchant_id, 1)"""),
+                    """INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
+                       VALUES (%s, %s, %s, 100, 1, %s, 1)""",
                     {
                         "sku": sku,
                         "name": '会员星卡',
@@ -448,7 +432,7 @@ async def submit_test_order(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/subsidy/distribute", response_model=ResponseModel, summary="发放周补贴")
+@router.post("/api/subsidy/distribute", response_model=ResponseModel, summary="发放周补贴")
 async def distribute_subsidy(
         service: FinanceService = Depends(get_finance_service)
 ):
@@ -460,14 +444,14 @@ async def distribute_subsidy(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/subsidy/fund", response_model=ResponseModel, summary="预存补贴资金")
+@router.post("/api/subsidy/fund", response_model=ResponseModel, summary="预存补贴资金")
 async def fund_subsidy_pool(
         service: FinanceService = Depends(get_finance_service),
         amount: float = Query(10000, gt=0)
 ):
     try:
         service.session.execute(
-            text("UPDATE finance_accounts SET balance = :amount WHERE account_type = 'subsidy_pool'"),
+            "UPDATE finance_accounts SET balance = %s WHERE account_type = 'subsidy_pool'",
             {"amount": amount}
         )
         service.session.commit()
@@ -478,7 +462,7 @@ async def fund_subsidy_pool(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/public-welfare", response_model=ResponseModel, summary="查询公益基金余额")
+@router.get("/api/public-welfare", response_model=ResponseModel, summary="查询公益基金余额")
 async def get_public_welfare_balance(
         service: FinanceService = Depends(get_finance_service)
 ):
@@ -500,7 +484,7 @@ async def get_public_welfare_balance(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/public-welfare/flow", response_model=ResponseModel, summary="公益基金流水明细")
+@router.get("/api/public-welfare/flow", response_model=ResponseModel, summary="公益基金流水明细")
 async def get_public_welfare_flow(
         limit: int = Query(50, description="返回条数"),
         service: FinanceService = Depends(get_finance_service)
@@ -513,7 +497,7 @@ async def get_public_welfare_flow(
                 return "系统"
             try:
                 result = service.session.execute(
-                    text("SELECT name FROM users WHERE id = :user_id"),
+                    "SELECT name FROM users WHERE id = %s",
                     {"user_id": uid}
                 )
                 row = result.fetchone()
@@ -538,7 +522,7 @@ async def get_public_welfare_flow(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/admin/reports/public-welfare", response_model=ResponseModel, summary="公益基金交易报表")
+@router.get("/api/admin/reports/public-welfare", response_model=ResponseModel, summary="公益基金交易报表")
 async def get_public_welfare_report(
         start_date: str = Query(..., description="开始日期 yyyy-MM-dd"),
         end_date: str = Query(..., description="结束日期 yyyy-MM-dd"),
@@ -552,7 +536,7 @@ async def get_public_welfare_report(
                 return "系统"
             try:
                 result = service.session.execute(
-                    text("SELECT name FROM users WHERE id = :user_id"),
+                    "SELECT name FROM users WHERE id = %s",
                     {"user_id": uid}
                 )
                 row = result.fetchone()
@@ -577,7 +561,7 @@ async def get_public_welfare_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/withdrawals", response_model=ResponseModel, summary="申请提现")
+@router.post("/api/withdrawals", response_model=ResponseModel, summary="申请提现")
 async def apply_withdrawal(
         request: WithdrawalRequest,
         service: FinanceService = Depends(get_finance_service)
@@ -595,7 +579,7 @@ async def apply_withdrawal(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.patch("/api/withdrawals/audit", response_model=ResponseModel, summary="审核提现")
+@router.patch("/api/withdrawals/audit", response_model=ResponseModel, summary="审核提现")
 async def audit_withdrawal(
         request: WithdrawalAuditRequest,
         service: FinanceService = Depends(get_finance_service)
@@ -610,7 +594,7 @@ async def audit_withdrawal(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/rewards/audit", response_model=ResponseModel, summary="批量审核奖励")
+@router.post("/api/rewards/audit", response_model=ResponseModel, summary="批量审核奖励")
 async def audit_rewards(
         request: RewardAuditRequest,
         service: FinanceService = Depends(get_finance_service)
@@ -626,7 +610,7 @@ async def audit_rewards(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/rewards/pending", response_model=ResponseModel, summary="查询奖励列表")
+@router.get("/api/rewards/pending", response_model=ResponseModel, summary="查询奖励列表")
 async def get_pending_rewards(
         service: FinanceService = Depends(get_finance_service),
         status: str = Query('pending', pattern=r'^(pending|approved|rejected)$'),
@@ -641,7 +625,7 @@ async def get_pending_rewards(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/coupons/{user_id}", response_model=ResponseModel, summary="查询用户优惠券")
+@router.get("/api/coupons/{user_id}", response_model=ResponseModel, summary="查询用户优惠券")
 async def get_user_coupons(
         user_id: int,
         service: FinanceService = Depends(get_finance_service),
@@ -655,7 +639,7 @@ async def get_user_coupons(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/reports/finance", response_model=ResponseModel, summary="财务总览报告")
+@router.get("/api/reports/finance", response_model=ResponseModel, summary="财务总览报告")
 async def get_finance_report(
         service: FinanceService = Depends(get_finance_service)
 ):
@@ -667,7 +651,7 @@ async def get_finance_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/reports/account-flow", response_model=ResponseModel, summary="资金流水报告")
+@router.get("/api/reports/account-flow", response_model=ResponseModel, summary="资金流水报告")
 async def get_account_flow_report(
         limit: int = Query(50, ge=1, le=1000),
         service: FinanceService = Depends(get_finance_service)
@@ -680,7 +664,7 @@ async def get_account_flow_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/reports/points-flow", response_model=ResponseModel, summary="积分流水报告")
+@router.get("/api/reports/points-flow", response_model=ResponseModel, summary="积分流水报告")
 async def get_points_flow_report(
         user_id: Optional[int] = Query(None, gt=0),
         limit: int = Query(50, ge=1, le=1000),
@@ -694,7 +678,7 @@ async def get_points_flow_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/admin/reports/points-deduction", response_model=ResponseModel, summary="积分抵扣明细报表")
+@router.get("/api/admin/reports/points-deduction", response_model=ResponseModel, summary="积分抵扣明细报表")
 async def get_points_deduction_report(
         start_date: str = Query(..., description="开始日期 yyyy-MM-dd"),
         end_date: str = Query(..., description="结束日期 yyyy-MM-dd"),
@@ -710,7 +694,7 @@ async def get_points_deduction_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/directors/check-promotion", response_model=ResponseModel, summary="执行荣誉董事晋升")
+@router.post("/api/directors/check-promotion", response_model=ResponseModel, summary="执行荣誉董事晋升")
 async def check_director_promotion(
         service: FinanceService = Depends(get_finance_service)
 ):
@@ -722,7 +706,7 @@ async def check_director_promotion(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/admin/reports/transaction-chain", response_model=ResponseModel, summary="交易推荐链报表")
+@router.get("/api/admin/reports/transaction-chain", response_model=ResponseModel, summary="交易推荐链报表")
 async def get_transaction_chain_report(
         user_id: int = Query(..., gt=0, description="购买者ID"),
         order_no: Optional[str] = Query(None, description="订单号（可选）"),
@@ -738,14 +722,14 @@ async def get_transaction_chain_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/orders/test-reward-chain", response_model=ResponseModel, summary="测试层级返利")
+@router.post("/api/orders/test-reward-chain", response_model=ResponseModel, summary="测试层级返利")
 async def test_reward_chain(
         service: FinanceService = Depends(get_finance_service),
         buyer_id: int = Query(..., gt=0, description="购买者ID")
 ):
     try:
         result = service.session.execute(
-            text("SELECT referrer_id FROM user_referrals WHERE user_id = :user_id"),
+            "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
             {"user_id": buyer_id}
         )
         ref = result.fetchone()
@@ -758,7 +742,7 @@ async def test_reward_chain(
 
         for layer in range(1, MAX_TEAM_LAYER + 1):
             result = service.session.execute(
-                text("SELECT referrer_id FROM user_referrals WHERE user_id = :user_id"),
+                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
                 {"user_id": current_id}
             )
             ref_info = result.fetchone()
@@ -767,7 +751,7 @@ async def test_reward_chain(
 
             referrer_id = ref_info.referrer_id
             result = service.session.execute(
-                text("SELECT name, member_level FROM users WHERE id = :user_id"),
+                "SELECT name, member_level FROM users WHERE id = %s",
                 {"user_id": referrer_id}
             )
             user_info = result.fetchone()
@@ -792,7 +776,7 @@ async def test_reward_chain(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/api/cleanup", response_model=ResponseModel, summary="清理测试数据")
+@router.delete("/api/cleanup", response_model=ResponseModel, summary="清理测试数据")
 async def cleanup_database(
         confirm: str = Query(..., description="确认参数，必须传入'YES'"),
         service: FinanceService = Depends(get_finance_service)
@@ -809,7 +793,7 @@ async def cleanup_database(
         ]
 
         for table in tables:
-            service.session.execute(text(f"DROP TABLE IF EXISTS {table}"))
+            service.session.execute(f"DROP TABLE IF EXISTS {table}")
 
         service.session.commit()
         return ResponseModel(success=True, message="测试环境清理完成")
@@ -819,3 +803,9 @@ async def cleanup_database(
         service.session.rollback()
         logger.error(f"清理测试环境失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def register_finance_routes(app: FastAPI):
+    """注册财务管理系统路由到主应用"""
+    # 为所有财务系统路由添加统一的 tags
+    app.include_router(router, tags=["财务系统"])

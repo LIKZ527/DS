@@ -47,23 +47,12 @@ DB_CONFIG = {
     "charset": "utf8mb4",
 }
 
-@contextmanager
-def get_conn():
-    """获取数据库连接的上下文管理器（兼容 config2.py）"""
-    cfg = get_db_config()
-    conn = pymysql.connect(
-        host=cfg['host'],
-        port=cfg['port'],
-        user=cfg['user'],
-        password=cfg['password'],
-        database=cfg['database'],
-        charset=cfg['charset'],
-        cursorclass=pymysql.cursors.DictCursor
-    )
-    try:
-        yield conn
-    finally:
-        conn.close()
+# 统一使用 core.database 模块的 get_conn
+# 为了保持向后兼容，这里导入并重新导出
+from core.database import get_conn
+
+# 保留原有的 get_conn 作为别名，确保向后兼容
+__all__ = ['get_conn', 'get_db_config', 'CFG', 'DB_CONFIG']
 
 
 # ==================== 平台常量 ====================
@@ -163,8 +152,21 @@ VALID_PAY_WAYS: Final[set[str]] = {"alipay", "wechat", "card", "wx_pub", "wx_app
 
 # ==================== 日志配置 ====================
 LOG_DIR: Final[str] = os.path.join(os.path.dirname(__file__), 'logs')
-LOG_FILE: Final[str] = os.path.join(LOG_DIR, 'finance.log')
+LOG_FILE: Final[str] = os.path.join(LOG_DIR, 'api.log')  # 统一日志文件路径
 os.makedirs(LOG_DIR, exist_ok=True)
+
+# ==================== 商品管理配置（来自 product/config.py） ====================
+from pathlib import Path
+
+# 上传目录
+BASE_PIC_DIR: Final[Path] = Path(__file__).resolve().parent / "pic_data"
+BASE_PIC_DIR.mkdir(exist_ok=True)
+
+# 分类白名单
+CATEGORY_CHOICES: Final[list[str]] = [
+    "服装鞋帽", "家居生活", "美妆护肤", "母婴用品",
+    "食品饮料", "数码电器", "图书文具", "运动户外", "其他"
+]
 
 
 # ==================== SQL 建表语句 ====================

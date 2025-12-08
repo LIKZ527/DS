@@ -1,15 +1,22 @@
 # database_setup.py - 表结构与项目2完全一致
+# 注意：此文件主要用于数据库表结构定义和初始化
+# 日常数据库操作请使用 config.get_conn() 或 core.database.get_conn()
 import logging
-#import pymysql
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy import create_engine
+from sqlalchemy.sql import text  # 仅用于表结构初始化
+from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.pool import QueuePool
-from config import get_db_config, PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE
+from config import get_db_config, PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE, LOG_FILE
 
+# 配置日志：统一输出到 logs/api.log
+# 注意：如果 finance_logic.py 已经配置了 basicConfig，这里不会重复配置
+# 使用 getLogger 获取 logger 实例，共享全局日志配置
 logger = logging.getLogger(__name__)
 
 _engine = None
-_SessionFactory = None
+
+# SQLAlchemy Base 类（用于 ORM 模型定义，product 模块仍在使用）
+Base = declarative_base()
 
 def get_engine():
     global _engine
@@ -36,43 +43,34 @@ def get_engine():
             raise
     return _engine
 
-def get_session_factory():
-    global _SessionFactory
-    if _SessionFactory is None:
-        engine = get_engine()
-        _SessionFactory = sessionmaker(
-            bind=engine,
-            autocommit=False,
-            autoflush=False,
-            expire_on_commit=False
-        )
-        logger.info("✅ 会话工厂已创建")
-    return _SessionFactory
-
-def get_db_session():
-    factory = get_session_factory()
-    db = scoped_session(factory)()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def get_conn(**kw):
-    """获取 pymysql 数据库连接（兼容 order 模块）
+# engine - 用于兼容 product 模块（延迟初始化）
+# 注意：这是一个属性访问，每次访问都会调用 get_engine()
+# 为了兼容 product 模块，我们提供一个属性访问方式
+class _EngineProxy:
+    """Engine 代理类，用于兼容 product 模块"""
+    def __getattr__(self, name):
+        return getattr(get_engine(), name)
     
-    参数:
-        **kw: 可选的数据库配置参数，会覆盖默认配置
-        
-    返回:
-        pymysql.Connection: 数据库连接对象
-    """
-    import pymysql
-    cfg = get_db_config().copy()
-    cfg.update(kw)
-    return pymysql.connect(
-        **cfg,
-        cursorclass=pymysql.cursors.DictCursor
-    )
+    def __call__(self, *args, **kwargs):
+        return get_engine()(*args, **kwargs)
+    
+    def connect(self, *args, **kwargs):
+        return get_engine().connect(*args, **kwargs)
+    
+    def execute(self, *args, **kwargs):
+        return get_engine().execute(*args, **kwargs)
+
+# 创建 engine 实例（兼容 product 模块）
+engine = _EngineProxy()
+
+# 注意：以下 Session 相关代码已废弃，统一使用 config.get_conn() 或 core.database.get_conn()
+# 保留 engine 用于表结构定义和初始化
+# 
+# 如需使用数据库连接，请使用：
+#   from config import get_conn
+#   with get_conn() as conn:
+#       with conn.cursor() as cur:
+#           cur.execute("SELECT ...")
 
 class DatabaseManager:
     def __init__(self):
@@ -103,9 +101,11 @@ class DatabaseManager:
             'users': """
                 CREATE TABLE IF NOT EXISTS users (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    mobile VARCHAR(30) UNIQUE NOT NULL,
-                    password_hash CHAR(60) NOT NULL,
-                    name VARCHAR(50) NOT NULL,
+                    mobile VARCHAR(30) UNIQUE,
+                    password_hash CHAR(60),
+                    name VARCHAR(100) NOT NULL,
+                    email VARCHAR(100) UNIQUE,
+                    phone VARCHAR(20),
                     member_level TINYINT NOT NULL DEFAULT 0,
                     points BIGINT NOT NULL DEFAULT 0,
                     promotion_balance DECIMAL(14,2) NOT NULL DEFAULT 0.00,
@@ -116,41 +116,70 @@ class DatabaseManager:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_mobile (mobile),
+                    INDEX idx_email (email),
                     INDEX idx_member_level (member_level)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'products': """
                 CREATE TABLE IF NOT EXISTS products (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    sku VARCHAR(64) UNIQUE NOT NULL,
+                    sku VARCHAR(64) UNIQUE,
                     name VARCHAR(255) NOT NULL,
-                    price DECIMAL(12,2) NOT NULL,
+                    pinyin TEXT,
+                    description TEXT,
+                    category VARCHAR(100),
+                    price DECIMAL(12,2) DEFAULT 0.00,
                     stock INT NOT NULL DEFAULT 0,
+                    main_image VARCHAR(500),
+                    detail_images TEXT,
+                    image_url VARCHAR(500),
                     is_member_product TINYINT(1) NOT NULL DEFAULT 0,
-                    status TINYINT NOT NULL DEFAULT 1,
-                    merchant_id BIGINT UNSIGNED NOT NULL,
+                    is_vip TINYINT(1) DEFAULT 0 COMMENT '1=会员商品（兼容订单系统）',
+                    status TINYINT NOT NULL DEFAULT 0,
+                    user_id BIGINT UNSIGNED,
+                    merchant_id BIGINT UNSIGNED,
+                    buy_rule TEXT,
+                    freight DECIMAL(12,2) DEFAULT 0.00,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_is_member_product (is_member_product),
-                    INDEX idx_merchant (merchant_id)
+                    INDEX idx_is_vip (is_vip),
+                    INDEX idx_merchant (merchant_id),
+                    INDEX idx_user_id (user_id),
+                    INDEX idx_status (status),
+                    INDEX idx_category (category)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'orders': """
                 CREATE TABLE IF NOT EXISTS orders (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    order_no VARCHAR(64) UNIQUE NOT NULL,
+                    order_no VARCHAR(64) UNIQUE,
+                    order_number VARCHAR(50) UNIQUE COMMENT '订单号（兼容订单系统）',
                     user_id BIGINT UNSIGNED NOT NULL,
-                    merchant_id BIGINT UNSIGNED NOT NULL,
+                    merchant_id BIGINT UNSIGNED,
                     total_amount DECIMAL(12,2) NOT NULL,
-                    original_amount DECIMAL(12,2) NOT NULL,
+                    original_amount DECIMAL(12,2) DEFAULT 0.00,
                     points_discount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
                     is_member_order TINYINT(1) NOT NULL DEFAULT 0,
-                    status VARCHAR(30) NOT NULL DEFAULT 'completed',
+                    is_vip_item TINYINT(1) DEFAULT 0 COMMENT '1=含会员商品（兼容订单系统）',
+                    status VARCHAR(30) NOT NULL DEFAULT 'pending_pay',
                     refund_status VARCHAR(30) DEFAULT NULL,
+                    consignee_name VARCHAR(100),
+                    consignee_phone VARCHAR(20),
+                    province VARCHAR(20) DEFAULT '',
+                    city VARCHAR(20) DEFAULT '',
+                    district VARCHAR(20) DEFAULT '',
+                    shipping_address TEXT,
+                    pay_way ENUM('alipay','wechat','card','wx_pub','wx_app') DEFAULT 'alipay',
+                    refund_reason TEXT,
+                    auto_recv_time DATETIME NULL COMMENT '7 天后自动收货',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_user (user_id),
                     INDEX idx_order_no (order_no),
-                    INDEX idx_created_at (created_at)
+                    INDEX idx_order_number (order_number),
+                    INDEX idx_created_at (created_at),
+                    INDEX idx_status (status)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'order_items': """
@@ -161,6 +190,7 @@ class DatabaseManager:
                     quantity INT NOT NULL DEFAULT 1,
                     unit_price DECIMAL(12,2) NOT NULL,
                     total_price DECIMAL(12,2) NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_order (order_id),
                     INDEX idx_product (product_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -297,116 +327,59 @@ class DatabaseManager:
             """,
             # ========== 订单系统相关表（来自 order/database_setup1.py） ==========
             'merchants': """
-                CREATE TABLE IF NOT EXISTS Merchants (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS merchants (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     name VARCHAR(100) NOT NULL,
                     login_user VARCHAR(50) UNIQUE NOT NULL,
                     login_pwd VARCHAR(255) NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'merchant_balance': """
-                CREATE TABLE IF NOT EXISTS Merchant_Balance (
-                    merchant_id INT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS merchant_balance (
+                    merchant_id BIGINT UNSIGNED PRIMARY KEY,
                     balance DECIMAL(10,2) NOT NULL DEFAULT 0,
                     bank_name VARCHAR(100) DEFAULT '',
                     bank_account VARCHAR(50) DEFAULT '',
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    FOREIGN KEY (merchant_id) REFERENCES Merchants(id)
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
-            'order_users': """
-                CREATE TABLE IF NOT EXISTS Users (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(100) NOT NULL,
-                    email VARCHAR(100) UNIQUE NOT NULL,
-                    phone VARCHAR(20),
-                    points INT DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
-            'order_products': """
-                CREATE TABLE IF NOT EXISTS Products (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(200) NOT NULL,
-                    sku VARCHAR(50) UNIQUE NOT NULL,
-                    price DECIMAL(10,2) NOT NULL,
-                    stock INT DEFAULT 0,
-                    category VARCHAR(100),
-                    image_url VARCHAR(500),
-                    description TEXT,
-                    is_vip TINYINT(1) DEFAULT 0 COMMENT '1=会员商品',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
+            # 注意：Merchant_Balance 表的外键约束在表创建后单独添加
+            # 注意：Users 和 Products 表已整合到统一的 users 和 products 表中
             'cart': """
-                CREATE TABLE IF NOT EXISTS Cart (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id INT NOT NULL,
-                    product_id INT NOT NULL,
+                CREATE TABLE IF NOT EXISTS cart (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT UNSIGNED NOT NULL,
+                    product_id BIGINT UNSIGNED NOT NULL,
                     quantity INT DEFAULT 1,
                     selected TINYINT DEFAULT 1,
-                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES Users(id) ON DELETE CASCADE,
-                    FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE,
-                    UNIQUE KEY uk_user_product (user_id, product_id)
+                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uk_user_product (user_id, product_id),
+                    INDEX idx_user_id (user_id),
+                    INDEX idx_product_id (product_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
-            'order_orders': """
-                CREATE TABLE IF NOT EXISTS Orders (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id INT NOT NULL,
-                    order_number VARCHAR(50) UNIQUE NOT NULL,
-                    total_amount DECIMAL(10,2) NOT NULL,
-                    status ENUM('pending_pay','pending_ship','pending_recv','refund','completed') DEFAULT 'pending_pay',
-                    consignee_name VARCHAR(100) NOT NULL,
-                    consignee_phone VARCHAR(20) NOT NULL,
-                    province VARCHAR(20) NOT NULL DEFAULT '',
-                    city VARCHAR(20) NOT NULL DEFAULT '',
-                    district VARCHAR(20) NOT NULL DEFAULT '',
-                    shipping_address TEXT NOT NULL,
-                    pay_way ENUM('alipay','wechat','card','wx_pub','wx_app') DEFAULT 'alipay',
-                    is_vip_item TINYINT(1) DEFAULT 0 COMMENT '1=含会员商品',
-                    refund_reason TEXT,
-                    auto_recv_time DATETIME NULL COMMENT '7 天后自动收货',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES Users(id) ON DELETE CASCADE
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
-            'order_items_extended': """
-                CREATE TABLE IF NOT EXISTS Order_Items (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    order_id INT NOT NULL,
-                    product_id INT NOT NULL,
-                    quantity INT NOT NULL,
-                    unit_price DECIMAL(10,2) NOT NULL,
-                    total_price DECIMAL(10,2) NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (order_id) REFERENCES Orders(id) ON DELETE CASCADE,
-                    FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
+            # 注意：Cart 表的外键约束在表创建后单独添加，避免类型不匹配问题
+            # 注意：Orders 和 Order_Items 表已整合到统一的 orders 和 order_items 表中
             'refunds': """
-                CREATE TABLE IF NOT EXISTS Refunds (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS refunds (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     order_number VARCHAR(50) NOT NULL,
                     refund_type ENUM('return','refund_only') NOT NULL COMMENT 'return=退货退款，refund_only=仅退款',
                     reason TEXT NOT NULL,
                     status ENUM('applied','seller_ok','success','rejected') DEFAULT 'applied',
                     reject_reason TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    FOREIGN KEY (order_number) REFERENCES Orders(order_number) ON DELETE CASCADE
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_order_number (order_number)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
+            # 注意：Refunds 表的外键约束在表创建后单独添加，避免类型不匹配问题
             'user_addresses': """
-                CREATE TABLE IF NOT EXISTS User_Addresses (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id INT NOT NULL,
+                CREATE TABLE IF NOT EXISTS user_addresses (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT UNSIGNED NOT NULL,
                     label VARCHAR(20) NOT NULL COMMENT '家/公司/朋友',
                     consignee_name VARCHAR(100) NOT NULL,
                     consignee_phone VARCHAR(20) NOT NULL,
@@ -417,25 +390,25 @@ class DatabaseManager:
                     lng DECIMAL(10,6) NULL,
                     lat DECIMAL(10,6) NULL,
                     is_default TINYINT(1) DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES Users(id) ON DELETE CASCADE,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_user (user_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
+            # 注意：User_Addresses 表的外键约束在表创建后单独添加
             'order_split': """
                 CREATE TABLE IF NOT EXISTS order_split (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     order_number VARCHAR(50) NOT NULL,
                     item_type ENUM('merchant','pool') NOT NULL,
                     amount DECIMAL(10,2) NOT NULL,
                     pool_type VARCHAR(20) NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'merchant_statement': """
                 CREATE TABLE IF NOT EXISTS merchant_statement (
-                    merchant_id INT NOT NULL,
+                    merchant_id BIGINT UNSIGNED NOT NULL,
                     date DATE NOT NULL,
                     opening_balance DECIMAL(10,2) NOT NULL,
                     income DECIMAL(10,2) NOT NULL,
@@ -446,12 +419,12 @@ class DatabaseManager:
             """,
             'alert_order': """
                 CREATE TABLE IF NOT EXISTS alert_order (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     order_number VARCHAR(50) NOT NULL,
                     alert_type VARCHAR(50) NOT NULL,
                     detail TEXT NOT NULL,
                     is_handled TINYINT(1) DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
         }
@@ -460,8 +433,220 @@ class DatabaseManager:
             conn.execute(text(sql))
             logger.info(f"✅ 表 `{table_name}` 已创建/确认")
 
+        # 在表创建后添加外键约束（避免类型不匹配问题）
+        self._add_cart_foreign_keys(conn)
+        self._add_refunds_foreign_keys(conn)
+        self._add_orders_foreign_keys(conn)
+        self._add_order_items_foreign_keys(conn)
+        self._add_user_addresses_foreign_keys(conn)
+        self._add_merchant_balance_foreign_keys(conn)
+
         self._init_finance_accounts(conn)
         logger.info("✅ 所有表结构初始化完成")
+
+    def _add_cart_foreign_keys(self, conn):
+        """为 cart 表添加外键约束（如果不存在）"""
+        try:
+            # 检查 cart 表和被引用表是否存在
+            result = conn.execute(text("""
+                SELECT TABLE_NAME 
+                FROM information_schema.TABLES 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME IN ('cart', 'users', 'products')
+            """))
+            existing_tables = {row[0] for row in result.fetchall()}
+            
+            if 'cart' not in existing_tables or 'users' not in existing_tables or 'products' not in existing_tables:
+                logger.debug("⚠️ cart 表或引用表不存在，跳过外键添加")
+                return
+            
+            # 检查外键是否已存在
+            result = conn.execute(text("""
+                SELECT CONSTRAINT_NAME 
+                FROM information_schema.TABLE_CONSTRAINTS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'cart' 
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """))
+            existing_fks = [row[0] for row in result.fetchall()]
+            
+            if 'cart_ibfk_1' not in existing_fks:
+                conn.execute(text("""
+                    ALTER TABLE cart 
+                    ADD CONSTRAINT cart_ibfk_1 
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                """))
+                logger.info("✅ cart 表外键约束 cart_ibfk_1 已添加")
+            
+            if 'cart_ibfk_2' not in existing_fks:
+                conn.execute(text("""
+                    ALTER TABLE cart 
+                    ADD CONSTRAINT cart_ibfk_2 
+                    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+                """))
+                logger.info("✅ cart 表外键约束 cart_ibfk_2 已添加")
+        except Exception as e:
+            # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
+            logger.debug(f"⚠️ cart 表外键约束添加失败（已忽略）: {e}")
+
+    def _add_refunds_foreign_keys(self, conn):
+        """为 refunds 表添加外键约束（如果不存在）"""
+        try:
+            # 检查 refunds 表和 orders 表是否存在，以及 orders 表是否有 order_number 列
+            result = conn.execute(text("""
+                SELECT TABLE_NAME 
+                FROM information_schema.TABLES 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME IN ('refunds', 'orders')
+            """))
+            existing_tables = {row[0] for row in result.fetchall()}
+            
+            if 'refunds' not in existing_tables or 'orders' not in existing_tables:
+                logger.debug("⚠️ refunds 表或 orders 表不存在，跳过外键添加")
+                return
+            
+            # 检查 orders 表是否有 order_number 列
+            result = conn.execute(text("""
+                SELECT COLUMN_NAME 
+                FROM information_schema.COLUMNS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'orders' 
+                AND COLUMN_NAME = 'order_number'
+            """))
+            if result.fetchone() is None:
+                logger.debug("⚠️ orders 表缺少 order_number 列，跳过外键添加")
+                return
+            
+            # 检查外键是否已存在
+            result = conn.execute(text("""
+                SELECT CONSTRAINT_NAME 
+                FROM information_schema.TABLE_CONSTRAINTS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'refunds' 
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """))
+            existing_fks = [row[0] for row in result.fetchall()]
+            
+            if 'refunds_ibfk_1' not in existing_fks:
+                conn.execute(text("""
+                    ALTER TABLE refunds 
+                    ADD CONSTRAINT refunds_ibfk_1 
+                    FOREIGN KEY (order_number) REFERENCES orders(order_number) ON DELETE CASCADE
+                """))
+                logger.info("✅ refunds 表外键约束 refunds_ibfk_1 已添加")
+        except Exception as e:
+            # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
+            logger.debug(f"⚠️ refunds 表外键约束添加失败（已忽略）: {e}")
+
+    def _add_orders_foreign_keys(self, conn):
+        """为 orders 表添加外键约束（如果不存在）"""
+        try:
+            result = conn.execute(text("""
+                SELECT CONSTRAINT_NAME 
+                FROM information_schema.TABLE_CONSTRAINTS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'orders' 
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """))
+            existing_fks = [row[0] for row in result.fetchall()]
+            
+            if 'orders_ibfk_1' not in existing_fks:
+                conn.execute(text("""
+                    ALTER TABLE orders 
+                    ADD CONSTRAINT orders_ibfk_1 
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                """))
+                logger.info("✅ orders 表外键约束 orders_ibfk_1 已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ orders 表外键约束添加失败（可忽略）: {e}")
+
+    def _add_order_items_foreign_keys(self, conn):
+        """为 order_items 表添加外键约束（如果不存在）"""
+        try:
+            result = conn.execute(text("""
+                SELECT CONSTRAINT_NAME 
+                FROM information_schema.TABLE_CONSTRAINTS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'order_items' 
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """))
+            existing_fks = [row[0] for row in result.fetchall()]
+            
+            if 'order_items_ibfk_1' not in existing_fks:
+                conn.execute(text("""
+                    ALTER TABLE order_items 
+                    ADD CONSTRAINT order_items_ibfk_1 
+                    FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+                """))
+                logger.info("✅ order_items 表外键约束 order_items_ibfk_1 已添加")
+            
+            if 'order_items_ibfk_2' not in existing_fks:
+                conn.execute(text("""
+                    ALTER TABLE order_items 
+                    ADD CONSTRAINT order_items_ibfk_2 
+                    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+                """))
+                logger.info("✅ order_items 表外键约束 order_items_ibfk_2 已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ order_items 表外键约束添加失败（可忽略）: {e}")
+
+    def _add_user_addresses_foreign_keys(self, conn):
+        """为 user_addresses 表添加外键约束（如果不存在）"""
+        try:
+            # 检查 user_addresses 表和 users 表是否存在
+            result = conn.execute(text("""
+                SELECT TABLE_NAME 
+                FROM information_schema.TABLES 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME IN ('user_addresses', 'users')
+            """))
+            existing_tables = {row[0] for row in result.fetchall()}
+            
+            if 'user_addresses' not in existing_tables or 'users' not in existing_tables:
+                logger.debug("⚠️ user_addresses 表或 users 表不存在，跳过外键添加")
+                return
+            
+            result = conn.execute(text("""
+                SELECT CONSTRAINT_NAME 
+                FROM information_schema.TABLE_CONSTRAINTS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'user_addresses' 
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """))
+            existing_fks = [row[0] for row in result.fetchall()]
+            
+            if 'user_addresses_ibfk_1' not in existing_fks:
+                conn.execute(text("""
+                    ALTER TABLE user_addresses 
+                    ADD CONSTRAINT user_addresses_ibfk_1 
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                """))
+                logger.info("✅ user_addresses 表外键约束 user_addresses_ibfk_1 已添加")
+        except Exception as e:
+            # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
+            logger.debug(f"⚠️ user_addresses 表外键约束添加失败（已忽略）: {e}")
+
+    def _add_merchant_balance_foreign_keys(self, conn):
+        """为 merchant_balance 表添加外键约束（如果不存在）"""
+        try:
+            result = conn.execute(text("""
+                SELECT CONSTRAINT_NAME 
+                FROM information_schema.TABLE_CONSTRAINTS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'merchant_balance' 
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """))
+            existing_fks = [row[0] for row in result.fetchall()]
+            
+            if 'merchant_balance_ibfk_1' not in existing_fks:
+                conn.execute(text("""
+                    ALTER TABLE merchant_balance 
+                    ADD CONSTRAINT merchant_balance_ibfk_1 
+                    FOREIGN KEY (merchant_id) REFERENCES merchants(id)
+                """))
+                logger.info("✅ merchant_balance 表外键约束 merchant_balance_ibfk_1 已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ merchant_balance 表外键约束添加失败（可忽略）: {e}")
 
     def _init_finance_accounts(self, conn):
         accounts = [
@@ -630,17 +815,18 @@ def auto_receive_task(db_cfg: dict = None):
     def run():
         while True:
             try:
+                from config import get_conn
                 with get_conn() as conn:
                     with conn.cursor() as cur:
                         now = datetime.now()
                         cur.execute(
-                            "SELECT id, order_number, total_amount FROM Orders "
+                            "SELECT id, order_number, total_amount FROM orders "
                             "WHERE status='pending_recv' AND auto_recv_time<=%s",
                             (now,)
                         )
                         for row in cur.fetchall():
                             cur.execute(
-                                "UPDATE Orders SET status='completed' WHERE id=%s",
+                                "UPDATE orders SET status='completed' WHERE id=%s",
                                 (row["id"],)
                             )
                             # 注意：settle_to_merchant 函数需要从 order 模块导入
@@ -654,3 +840,73 @@ def auto_receive_task(db_cfg: dict = None):
     t = threading.Thread(target=run, daemon=True)
     t.start()
     logger.info("✅ 自动收货守护进程已启动")
+
+
+# ==================== Product 模块相关功能（来自 product/database_setup.py） ====================
+
+def _fix_pinyin():
+    """补全商品拼音（来自 product/init_db.py 的 fix_pinyin_once 函数）
+    
+    该函数会检查所有商品，如果 pinyin 字段为空，则自动生成拼音。
+    可重复执行，幂等操作。
+    等价于 product/init_db.py 中的 fix_pinyin_once() 函数。
+    """
+    try:
+        from pypinyin import lazy_pinyin, Style
+        from config import get_conn
+        
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 查询所有商品
+                cur.execute("SELECT id, name, pinyin FROM products")
+                products = cur.fetchall()
+                
+                updated_count = 0
+                for product in products:
+                    if not product.get('pinyin'):
+                        pinyin = ' '.join(lazy_pinyin(product['name'], style=Style.NORMAL)).upper()
+                        cur.execute("UPDATE products SET pinyin = %s WHERE id = %s", (pinyin, product['id']))
+                        updated_count += 1
+                
+                conn.commit()
+                logger.info(f"✅ 商品拼音补全完成，更新了 {updated_count} 条记录")
+    except ImportError:
+        logger.warning("⚠️ pypinyin 未安装，跳过拼音补全功能")
+    except Exception as e:
+        logger.error(f"❌ 拼音补全失败: {e}")
+
+
+def create_tables_with_orm():
+    """根据 ORM 模型建表（来自 product/init_db.py）
+    
+    该函数会创建所有 ORM 模型定义的表。
+    等价于 product/init_db.py 中的 create_tables() 函数。
+    """
+    try:
+        # 导入 product 模块的模型，确保所有模型都被注册到 Base.metadata
+        from product.models import Product, ProductSku, ProductAttribute, Banner
+        engine = get_engine()
+        Base.metadata.create_all(engine)
+        logger.info("✅ ORM 模型表创建完成")
+    except Exception as e:
+        logger.warning(f"⚠️ ORM 表创建失败（可忽略）: {e}")
+
+
+def initialize_database_with_orm():
+    """初始化数据库（包含 ORM 表创建和拼音补全，兼容 product 模块）
+    
+    该函数会：
+    1. 确保数据库存在
+    2. 创建所有表（包括 ORM 模型定义的表）
+    3. 补全商品拼音
+    
+    等价于 product/init_db.py 中的 main() 函数（已注释掉的功能）。
+    """
+    # 先执行标准的数据库初始化
+    initialize_database()
+    
+    # 创建 ORM 模型定义的表
+    create_tables_with_orm()
+    
+    # 补全拼音
+    _fix_pinyin()
