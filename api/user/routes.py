@@ -112,11 +112,9 @@ def self_delete(body: SelfDeleteReq):
             if not verify_pwd(body.password, u["password_hash"]):
                 raise HTTPException(status_code=403, detail="密码错误")
 
-            cur.execute(
-                "INSERT INTO audit_log(user_id, op_type, old_val, new_val, reason) VALUES (%s,'SELF_DELETE',%s,%s,%s)",
-                (u["id"], int(u["status"]), int(UserStatus.DELETED), body.reason)
-            )
-            cur.execute("UPDATE users SET status=%s WHERE id=%s", (int(UserStatus.DELETED), u["id"]))
+            # 更新用户状态为 DELETED
+            new_status = int(UserStatus.DELETED)
+            cur.execute("UPDATE users SET status=%s WHERE id=%s", (new_status, u["id"]))
             conn.commit()
     return {"msg": "账号已注销"}
 
@@ -138,10 +136,6 @@ def freeze_user(body: FreezeReq):
             if u["status"] == new_status:
                 return {"msg": "已是冻结状态"}
 
-            cur.execute(
-                "INSERT INTO audit_log(user_id, op_type, old_val, new_val, reason) VALUES (%s,'FREEZE',%s,%s,%s)",
-                (u["id"], u["status"], new_status, body.reason)
-            )
             cur.execute("UPDATE users SET status=%s WHERE id=%s", (new_status, u["id"]))
             conn.commit()
     return {"msg": "已冻结"}
@@ -162,10 +156,6 @@ def unfreeze_user(body: FreezeReq):
             if u["status"] == new_status:
                 return {"msg": "已是正常状态"}
 
-            cur.execute(
-                "INSERT INTO audit_log(user_id, op_type, old_val, new_val, reason) VALUES (%s,'UNFREEZE',%s,%s,%s)",
-                (u["id"], u["status"], new_status, body.reason)
-            )
             cur.execute("UPDATE users SET status=%s WHERE id=%s", (new_status, u["id"]))
             conn.commit()
     return {"msg": "已解冻"}
