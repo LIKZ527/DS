@@ -3,7 +3,7 @@
 # 日常数据库操作请使用 core.database.get_conn()
 # 已移除 SQLAlchemy ORM，完全使用 pymysql
 import pymysql
-from core.config import get_db_config, PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE
+from core.config import get_db_config
 from core.logging import get_logger
 
 # 使用统一的日志配置
@@ -42,7 +42,6 @@ class DatabaseManager:
                     password_hash CHAR(60),
                     name VARCHAR(100) NOT NULL,
                     email VARCHAR(100) UNIQUE,
-                    phone VARCHAR(20),
                     member_level TINYINT NOT NULL DEFAULT 0,
                     points DECIMAL(12,4) NOT NULL DEFAULT 0.0000,
                     promotion_balance DECIMAL(14,2) NOT NULL DEFAULT 0.00,
@@ -66,28 +65,20 @@ class DatabaseManager:
             'products': """
                 CREATE TABLE IF NOT EXISTS products (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    sku VARCHAR(64) UNIQUE,
                     name VARCHAR(255) NOT NULL,
                     pinyin TEXT,
                     description TEXT,
                     category VARCHAR(100),
-                    price DECIMAL(12,2) DEFAULT 0.00,
-                    stock INT NOT NULL DEFAULT 0,
                     main_image VARCHAR(500),
                     detail_images TEXT,
-                    image_url VARCHAR(500),
                     is_member_product TINYINT(1) NOT NULL DEFAULT 0,
-                    is_vip TINYINT(1) DEFAULT 0 COMMENT '1=会员商品（兼容订单系统）',
                     status TINYINT NOT NULL DEFAULT 0,
                     user_id BIGINT UNSIGNED,
-                    merchant_id BIGINT UNSIGNED,
                     buy_rule TEXT,
                     freight DECIMAL(12,2) DEFAULT 0.00,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_is_member_product (is_member_product),
-                    INDEX idx_is_vip (is_vip),
-                    INDEX idx_merchant (merchant_id),
                     INDEX idx_user_id (user_id),
                     INDEX idx_status (status),
                     INDEX idx_category (category)
@@ -96,10 +87,8 @@ class DatabaseManager:
             'orders': """
                 CREATE TABLE IF NOT EXISTS orders (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    order_no VARCHAR(64) UNIQUE,
                     order_number VARCHAR(50) UNIQUE COMMENT '订单号（兼容订单系统）',
                     user_id BIGINT UNSIGNED NOT NULL,
-                    merchant_id BIGINT UNSIGNED,
                     total_amount DECIMAL(12,2) NOT NULL,
                     original_amount DECIMAL(12,2) DEFAULT 0.00,
                     points_discount DECIMAL(12,4) NOT NULL DEFAULT 0.0000,
@@ -119,7 +108,6 @@ class DatabaseManager:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_user (user_id),
-                    INDEX idx_order_no (order_no),
                     INDEX idx_order_number (order_number),
                     INDEX idx_created_at (created_at),
                     INDEX idx_status (status)
@@ -257,25 +245,6 @@ class DatabaseManager:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             # ========== 订单系统相关表（来自 order/database_setup1.py） ==========
-            'merchants': """
-                CREATE TABLE IF NOT EXISTS merchants (
-                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(100) NOT NULL,
-                    login_user VARCHAR(50) UNIQUE NOT NULL,
-                    login_pwd VARCHAR(255) NOT NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
-            'merchant_balance': """
-                CREATE TABLE IF NOT EXISTS merchant_balance (
-                    merchant_id BIGINT UNSIGNED PRIMARY KEY,
-                    balance DECIMAL(10,2) NOT NULL DEFAULT 0,
-                    bank_name VARCHAR(100) DEFAULT '',
-                    bank_account VARCHAR(50) DEFAULT '',
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
-            # 注意：Merchant_Balance 表的外键约束在表创建后单独添加
             # 注意：Users 和 Products 表已整合到统一的 users 和 products 表中
             'cart': """
                 CREATE TABLE IF NOT EXISTS cart (
@@ -328,16 +297,6 @@ class DatabaseManager:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             # 注意：User_Addresses 表的外键约束在表创建后单独添加
-            'order_split': """
-                CREATE TABLE IF NOT EXISTS order_split (
-                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    order_number VARCHAR(50) NOT NULL,
-                    item_type ENUM('merchant','pool') NOT NULL,
-                    amount DECIMAL(10,2) NOT NULL,
-                    pool_type VARCHAR(20) NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
             'merchant_statement': """
                 CREATE TABLE IF NOT EXISTS merchant_statement (
                     merchant_id BIGINT UNSIGNED NOT NULL,
@@ -392,24 +351,6 @@ class DatabaseManager:
                     INDEX idx_product_id (product_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
-            'merchant_balance_income': """
-                CREATE TABLE IF NOT EXISTS merchant_balance_income (
-                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    merchant_id BIGINT UNSIGNED NOT NULL COMMENT '商户id',
-                    amount DECIMAL(10,2) NOT NULL COMMENT '金额',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-                    INDEX idx_merchant_id (merchant_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
-            'merchant_withdraw': """
-                CREATE TABLE IF NOT EXISTS merchant_withdraw (
-                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                    merchant_id BIGINT UNSIGNED NOT NULL COMMENT '商户id',
-                    amount DECIMAL(10,2) NOT NULL COMMENT '金额',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-                    INDEX idx_merchant_id (merchant_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
         }
 
         for table_name, sql in tables.items():
@@ -422,7 +363,6 @@ class DatabaseManager:
         self._add_orders_foreign_keys(cursor)
         self._add_order_items_foreign_keys(cursor)
         self._add_user_addresses_foreign_keys(cursor)
-        self._add_merchant_balance_foreign_keys(cursor)
         self._add_banner_foreign_keys(cursor)
         self._add_product_attributes_foreign_keys(cursor)
         self._add_product_skus_foreign_keys(cursor)
@@ -612,28 +552,6 @@ class DatabaseManager:
             # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
             logger.debug(f"⚠️ user_addresses 表外键约束添加失败（已忽略）: {e}")
 
-    def _add_merchant_balance_foreign_keys(self, cursor):
-        """为 merchant_balance 表添加外键约束（如果不存在）"""
-        try:
-            cursor.execute("""
-                SELECT CONSTRAINT_NAME 
-                FROM information_schema.TABLE_CONSTRAINTS 
-                WHERE TABLE_SCHEMA = DATABASE() 
-                AND TABLE_NAME = 'merchant_balance' 
-                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
-            """)
-            existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
-            
-            if 'merchant_balance_ibfk_1' not in existing_fks:
-                cursor.execute("""
-                    ALTER TABLE merchant_balance 
-                    ADD CONSTRAINT merchant_balance_ibfk_1 
-                    FOREIGN KEY (merchant_id) REFERENCES merchants(id)
-                """)
-                logger.info("✅ merchant_balance 表外键约束 merchant_balance_ibfk_1 已添加")
-        except Exception as e:
-            logger.warning(f"⚠️ merchant_balance 表外键约束添加失败（可忽略）: {e}")
-
     def _add_banner_foreign_keys(self, cursor):
         """为 banner 表添加外键约束（如果不存在）"""
         try:
@@ -733,44 +651,44 @@ class DatabaseManager:
         cursor.execute("SELECT id FROM users WHERE mobile = %s", (mobile,))
         existing = cursor.fetchone()
         if existing:
-            merchant_id = existing['id']
-            logger.info(f"ℹ️ 测试商家手机号已存在，复用商家ID: {merchant_id}")
+            user_id = existing['id']
+            logger.info(f"ℹ️ 测试用户手机号已存在，复用用户ID: {user_id}")
         else:
             cursor.execute(
                 "INSERT INTO users (mobile, password_hash, name, status) VALUES (%s, %s, %s, 1)",
-                (mobile, pwd_hash, '优质商家')
+                (mobile, pwd_hash, '测试用户')
             )
-            merchant_id = cursor.lastrowid
+            user_id = cursor.lastrowid
 
-        # 创建会员商品（若 SKU 已存在则跳过）
-        sku_member = 'SKU-MEMBER-001'
-        cursor.execute("SELECT id FROM products WHERE sku = %s", (sku_member,))
+        # 创建会员商品（若名称已存在则跳过）
+        product_name_member = '会员星卡'
+        cursor.execute("SELECT id FROM products WHERE name = %s", (product_name_member,))
         existing_prod = cursor.fetchone()
         if existing_prod:
-            logger.info(f"ℹ️ 会员商品 SKU 已存在，跳过插入，product_id={existing_prod['id']}")
+            logger.info(f"ℹ️ 会员商品已存在，跳过插入，product_id={existing_prod['id']}")
         else:
             cursor.execute(
-                """INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
-                   VALUES (%s, %s, %s, 100, 1, %s, 1)""",
-                (sku_member, '会员星卡', float(MEMBER_PRODUCT_PRICE), PLATFORM_MERCHANT_ID)
+                """INSERT INTO products (name, is_member_product, user_id, status)
+                   VALUES (%s, 1, %s, 1)""",
+                (product_name_member, user_id)
             )
 
-        # 创建普通商品（若 SKU 已存在则跳过）
-        sku_normal = 'SKU-NORMAL-001'
-        cursor.execute("SELECT id FROM products WHERE sku = %s", (sku_normal,))
+        # 创建普通商品（若名称已存在则跳过）
+        product_name_normal = '普通商品'
+        cursor.execute("SELECT id FROM products WHERE name = %s", (product_name_normal,))
         existing_normal = cursor.fetchone()
         if existing_normal:
-            logger.info(f"ℹ️ 普通商品 SKU 已存在，跳过插入，product_id={existing_normal['id']}")
+            logger.info(f"ℹ️ 普通商品已存在，跳过插入，product_id={existing_normal['id']}")
         else:
             cursor.execute(
-                """INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
-                   VALUES (%s, %s, 500.00, 200, 0, %s, 1)""",
-                (sku_normal, '普通商品', merchant_id)
+                """INSERT INTO products (name, is_member_product, user_id, status)
+                   VALUES (%s, 0, %s, 1)""",
+                (product_name_normal, user_id)
             )
 
         conn.commit()
-        logger.info(f"✅ 测试数据创建完成 | 商家ID: {merchant_id}")
-        return merchant_id
+        logger.info(f"✅ 测试数据创建完成 | 用户ID: {user_id}")
+        return user_id
 
 
 # ==================== 数据库初始化函数 ====================
