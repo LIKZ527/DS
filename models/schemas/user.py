@@ -1,6 +1,6 @@
 # models/schemas/user.py - 用户系统 Pydantic 模型
 from fastapi import Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional
 from core.config import UserStatus
 
@@ -49,7 +49,7 @@ class AddressReq(BaseModel):
     addr_type: str = "shipping"
 
     class Config:
-        allow_population_by_field_name = True   # 同时支持 name / consignee_name
+        model_config = ConfigDict(validate_by_name=True)   # 同时支持 name / consignee_name
 
 
 class PointsReq(BaseModel):
