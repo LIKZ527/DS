@@ -370,7 +370,7 @@ def refer_team(mobile: str, max_layer: int = 6):
             return {"rows": rows}
 
 # 地址模块
-@router.post("/address", summary="新增地址")
+@router.post("/address/add", summary="新增地址")
 def address_add(body: AddressReq):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -379,7 +379,7 @@ def address_add(body: AddressReq):
             if not u:
                 _err("用户不存在")
             addr_id = AddressService.add_address(
-                u["id"], body.name, body.phone, body.province, body.city,
+                u["id"], body.name, body.mobile, body.province, body.city,
                 body.district, body.detail, body.is_default, body.addr_type
             )
             return {"addr_id": addr_id}

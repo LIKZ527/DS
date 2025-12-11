@@ -32,7 +32,7 @@ class SetLevelReq(BaseModel):
 class AddressReq(BaseModel):
     mobile: str
     name: str
-    phone: str
+    mobile: str
     province: str
     city: str
     district: str
