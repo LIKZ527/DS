@@ -680,7 +680,8 @@ def set_default_addr(addr_id: int, mobile: str):
 def delete_addr(addr_id: int, mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM addresses WHERE id=%s", (addr_id,))
+            # 使用 user_addresses 表（兼容项目中其它地址接口）
+            cur.execute("SELECT user_id FROM user_addresses WHERE id=%s", (addr_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="地址不存在")
@@ -689,7 +690,7 @@ def delete_addr(addr_id: int, mobile: str):
             if not u or u["id"] != row["user_id"]:
                 raise HTTPException(status_code=403, detail="地址不属于当前用户")
 
-            cur.execute("DELETE FROM addresses WHERE id=%s", (addr_id,))
+            cur.execute("DELETE FROM user_addresses WHERE id=%s", (addr_id,))
             conn.commit()
     return {"msg": "ok"}
 
@@ -716,10 +717,18 @@ def return_addr_set(body: AddressReq):
 
             # 检查是否存在 is_merchant 字段并判断是否为商家
             cur.execute("SHOW COLUMNS FROM users LIKE 'is_merchant'")
-            if not cur.fetchone() or u.get("is_merchant") != 1:
+            col = cur.fetchone()
+            if not col:
+                # 表中没有 is_merchant 字段，视为未被授予商户身份
                 raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
 
-            user_id = u["id"]
+            # 读取用户的 is_merchant 字段以确认身份
+            cur.execute("SELECT id, is_merchant FROM users WHERE mobile=%s", (body.mobile,))
+            u2 = cur.fetchone()
+            if not u2 or u2.get("is_merchant") != 1:
+                raise HTTPException(status_code=404, detail="商家不存在或未被授予商户身份")
+
+            user_id = u2["id"]
 
             # 2. 嗅探真实字段
             cur.execute("SHOW COLUMNS FROM user_addresses")
@@ -749,10 +758,16 @@ def return_addr_set(body: AddressReq):
                 raise RuntimeError("user_addresses 表无可用字段，请检查表结构")
 
             # 5. 把该商家其他退货地址取消默认
-            cur.execute(
-                "UPDATE user_addresses SET is_default=0 WHERE user_id=%s AND addr_type='return'",
-                (user_id,)
-            )
+            if "addr_type" in cols:
+                cur.execute(
+                    "UPDATE user_addresses SET is_default=0 WHERE user_id=%s AND addr_type='return'",
+                    (user_id,)
+                )
+            else:
+                cur.execute(
+                    "UPDATE user_addresses SET is_default=0 WHERE user_id=%s",
+                    (user_id,)
+                )
 
             # 6. 插入新退货地址
             sql_cols = ",".join(insert_data.keys())
@@ -797,11 +812,26 @@ def points(body: PointsReq):
 def points_balance(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT member_points, merchant_points, withdrawable_balance FROM users WHERE mobile=%s", (mobile,))
+            # 嗅探 users 表，按存在的字段查询并对缺失字段降级为 0
+            cur.execute("SHOW COLUMNS FROM users")
+            cols = [r["Field"] for r in cur.fetchall()]
+
+            asset_fields = ["member_points", "merchant_points", "withdrawable_balance"]
+            present = [f for f in asset_fields if f in cols]
+            if not present:
+                # 表中没有资产字段，统一返回 0
+                return {f: 0 for f in asset_fields}
+
+            cur.execute(f"SELECT {', '.join(present)} FROM users WHERE mobile=%s", (mobile,))
             row = cur.fetchone()
             if not row:
                 _err("用户不存在")
-            return row
+
+            # 组装返回结果，缺失字段填 0
+            out = {f: 0 for f in asset_fields}
+            for f in present:
+                out[f] = row.get(f) if isinstance(row, dict) else row[0]
+            return out
 
 @router.get("/points/log", summary="积分流水")
 def points_log(mobile: str, points_type: str = "member", page: int = 1, size: int = 10):
