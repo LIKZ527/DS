@@ -52,6 +52,21 @@ def build_product_dict(product: Dict[str, Any], skus: List[Dict[str, Any]] = Non
                 base["detail_images"] = json.loads(base["detail_images"])
             except:
                 base["detail_images"] = []
+    # 兼容 main_image 既可能为单个字符串也可能为 JSON 列表的情况
+    if base.get("main_image"):
+        mi = base["main_image"]
+        try:
+            if isinstance(mi, str) and mi.strip().startswith("["):
+                parsed = json.loads(mi)
+                if isinstance(parsed, list):
+                    base["banner_images"] = parsed
+                    base["main_image"] = parsed[0] if parsed else None
+                else:
+                    base["banner_images"] = []
+            else:
+                base["banner_images"] = []
+        except Exception:
+            base["banner_images"] = []
 
     # ✅ 新增：处理SKU的specifications字段
     if base.get("skus"):
@@ -417,10 +432,22 @@ def add_product(payload: ProductCreate):
                 # 插入 attributes
                 if payload.attributes:
                     for attr in payload.attributes:
+                        # 兼容前端两种传参格式：{"name":"...","value":"..."} 或 {"key":"value"}
+                        if isinstance(attr, dict) and "name" in attr and "value" in attr:
+                            a_name = attr["name"]
+                            a_value = attr["value"]
+                        elif isinstance(attr, dict) and len(attr) >= 1:
+                            # 取第一个键值作为 name/value
+                            k, v = next(iter(attr.items()))
+                            a_name = k
+                            a_value = v
+                        else:
+                            a_name = None
+                            a_value = None
                         cur.execute("""
                             INSERT INTO product_attributes (product_id, name, value)
                             VALUES (%s, %s, %s)
-                        """, (product_id, attr["name"], attr["value"]))
+                        """, (product_id, a_name, a_value))
 
                 conn.commit()
 
@@ -551,12 +578,22 @@ def update_product(id: int, payload: ProductUpdate):
                 if payload.attributes is not None:
                     # 删除旧 attributes
                     cur.execute("DELETE FROM product_attributes WHERE product_id = %s", (id,))
-                    # 插入新 attributes
+                    # 插入新 attributes（兼容多种格式）
                     for attr in payload.attributes:
+                        if isinstance(attr, dict) and "name" in attr and "value" in attr:
+                            a_name = attr["name"]
+                            a_value = attr["value"]
+                        elif isinstance(attr, dict) and len(attr) >= 1:
+                            k, v = next(iter(attr.items()))
+                            a_name = k
+                            a_value = v
+                        else:
+                            a_name = None
+                            a_value = None
                         cur.execute("""
                             INSERT INTO product_attributes (product_id, name, value)
                             VALUES (%s, %s, %s)
-                        """, (id, attr["name"], attr["value"]))
+                        """, (id, a_name, a_value))
 
                 conn.commit()
 
@@ -627,12 +664,43 @@ def upload_images(
                 if not product:
                     raise HTTPException(status_code=404, detail="商品不存在")
 
+                # 初始化 detail_urls：若数据库中已有详情图则使用，否则设为 []
+                raw_detail = product.get('detail_images')
+                try:
+                    if raw_detail:
+                        if isinstance(raw_detail, str):
+                            detail_urls = json.loads(raw_detail)
+                        elif isinstance(raw_detail, list):
+                            detail_urls = raw_detail
+                        else:
+                            detail_urls = []
+                    else:
+                        detail_urls = []
+                except Exception:
+                    detail_urls = []
+
+                # 初始化 banner_urls：兼容 products.main_image 存储为 JSON 列表或单字符串
+                raw_main = product.get('main_image')
+                try:
+                    if raw_main:
+                        if isinstance(raw_main, str) and raw_main.strip().startswith('['):
+                            parsed = json.loads(raw_main)
+                            banner_urls = parsed if isinstance(parsed, list) else []
+                        elif isinstance(raw_main, list):
+                            banner_urls = raw_main
+                        else:
+                            # 单张字符串则作为首项
+                            banner_urls = [raw_main]
+                    else:
+                        banner_urls = []
+                except Exception:
+                    banner_urls = []
+
                 category = product['category']
                 cat_path = BASE_PIC_DIR / category
                 goods_path = cat_path / str(id)
                 goods_path.mkdir(parents=True, exist_ok=True)
 
-                detail_urls = []
                 if detail_images:
                     if len(detail_images) > 10:
                         raise HTTPException(status_code=400, detail="详情图最多10张")
@@ -654,14 +722,11 @@ def upload_images(
                     cur.execute("UPDATE products SET detail_images = %s WHERE id = %s",
                                 (json.dumps(detail_urls, ensure_ascii=False), id))
 
-                banner_urls = []
                 if banner_images:
                     if len(banner_images) > 10:
                         raise HTTPException(status_code=400, detail="轮播图最多10张")
-                    # 删除旧轮播图
-                    cur.execute("DELETE FROM banner WHERE product_id = %s", (id,))
-
-                    for idx, f in enumerate(banner_images):
+                    # 将上传的轮播图文件保存并加入 banner_urls 列表（与 detail_images 行为一致）
+                    for f in banner_images:
                         ext = Path(f.filename).suffix.lower()
                         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
                             raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
@@ -675,15 +740,11 @@ def upload_images(
                             im.save(file_path, "JPEG", quality=85, optimize=True)
                         url = f"/pic/{category}/{id}/{file_name}"
                         banner_urls.append(url)
-                        cur.execute("""
-                            INSERT INTO banner (product_id, image_url, sort_order, status)
-                            VALUES (%s, %s, %s, %s)
-                        """, (id, url, idx, 1))
 
-                    # 更新商品主图
+                    # 更新 products.main_image 为 JSON 列表（与 detail_images 一致）
                     if banner_urls:
                         cur.execute("UPDATE products SET main_image = %s WHERE id = %s",
-                                    (banner_urls[0], id))
+                                    (json.dumps(banner_urls, ensure_ascii=False), id))
 
                 conn.commit()
 
