@@ -54,7 +54,6 @@ class OrderManager:
                         raise HTTPException(status_code=422, detail="立即购买时 buy_now_items 不能为空")
                     items = []
                     for it in buy_now_items:
-                        # 把需要的字段补齐
                         cur.execute(
                             "SELECT is_member_product FROM products WHERE id = %s",
                             (it["product_id"],)
@@ -71,8 +70,18 @@ class OrderManager:
                             "price": Decimal(str(it["price"])),
                             "is_vip": prod["is_member_product"]
                         })
+                    # ====== 方案2：立即购买时，把地址写进变量 ======
+                    if custom_addr:
+                        consignee_name = custom_addr.get("consignee_name")
+                        consignee_phone = custom_addr.get("consignee_phone")
+                        province = custom_addr.get("province", "")
+                        city = custom_addr.get("city", "")
+                        district = custom_addr.get("district", "")
+                        shipping_address = custom_addr.get("detail", "")
+                    else:
+                        raise HTTPException(status_code=422, detail="立即购买必须上传 custom_address")
                 else:
-                    # 购物车结算场景（老逻辑）
+                    # 购物车结算场景
                     cur.execute("""
                         SELECT c.product_id,
                                c.quantity,
@@ -86,16 +95,30 @@ class OrderManager:
                     items = cur.fetchall()
                     if not items:
                         return None
+                    # 购物车场景，先留空，后续可扩展去默认地址表读
+                    consignee_name = consignee_phone = province = city = district = shipping_address = None
 
                 # ---------- 2. 订单主表 ----------
                 total = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
                 has_vip = any(i["is_vip"] for i in items)
                 order_number = datetime.now().strftime("%Y%m%d%H%M%S") + str(user_id) + str(uuid.uuid4().int)[:6]
 
+                # ====== 把 6 个地址字段一次性写进去 ======
                 cur.execute("""
-                    INSERT INTO orders(user_id, order_number, total_amount, status, is_vip_item, auto_recv_time)
-                    VALUES (%s, %s, %s, 'pending_pay', %s, %s)
-                """, (user_id, order_number, total, has_vip, datetime.now() + timedelta(days=7)))
+                    INSERT INTO orders(
+                        user_id, order_number, total_amount, status, is_vip_item,
+                        consignee_name, consignee_phone,
+                        province, city, district, shipping_address,
+                        pay_way, auto_recv_time)
+                    VALUES (%s, %s, %s, 'pending_pay', %s,
+                            %s, %s, %s, %s, %s, %s,
+                            'wechat', %s)
+                """, (
+                    user_id, order_number, total, has_vip,
+                    consignee_name, consignee_phone,
+                    province, city, district, shipping_address,
+                    datetime.now() + timedelta(days=7)
+                ))
                 oid = cur.lastrowid
 
                 # ---------- 3. 库存校验 & 扣减 ----------
@@ -172,12 +195,17 @@ class OrderManager:
     def detail(order_number: str) -> Optional[dict]:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 1. 只查 orders 单表
                 select_fields = OrderManager._build_orders_select(cur)
-                cur.execute(f"SELECT {select_fields} FROM orders WHERE order_number = %s",
-                            (order_number,))
+                cur.execute(
+                    f"SELECT {select_fields} FROM orders WHERE order_number = %s",
+                    (order_number,)
+                )
                 order_info = cur.fetchone()
                 if not order_info:
                     return None
+
+                # 2. 订单明细
                 cur.execute("""
                     SELECT oi.*, p.name
                     FROM order_items oi
@@ -185,18 +213,35 @@ class OrderManager:
                     WHERE oi.order_id = %s
                 """, (order_info["id"],))
                 items = cur.fetchall()
-                return {"order_info": order_info, "items": items}
 
+                # 3. 地址就是 orders 自身的 6 个字段
+                addr = {
+                    "consignee_name": order_info.get("consignee_name"),
+                    "consignee_phone": order_info.get("consignee_phone"),
+                    "province": order_info.get("province"),
+                    "city": order_info.get("city"),
+                    "district": order_info.get("district"),
+                    "detail": order_info.get("shipping_address")
+                } if any(order_info.get(k) for k in (
+                    "consignee_name", "consignee_phone", "province",
+                    "city", "district", "shipping_address"
+                )) else None
+
+                return {
+                    "order_info": order_info,
+                    "address": addr,
+                    "items": items
+                }
     @staticmethod
     def update_status(order_number: str, new_status: str, reason: Optional[str] = None) -> bool:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE orders SET status = %s, refund_reason = %s WHERE order_number = %s ",
-                    (new_status, reason, order_number))
+                    "UPDATE orders SET status = %s, refund_reason = %s WHERE order_number = %s",
+                    (new_status, reason, order_number)
+                )
                 conn.commit()
-                return True
-
+                return cur.rowcount > 0
 # ---------------- 请求模型 ----------------
 class OrderCreate(BaseModel):
     user_id: int
