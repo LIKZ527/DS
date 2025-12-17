@@ -712,6 +712,162 @@ async def clear_fund_pools(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# api/finance/routes.py
+
+# ... 在 clear_fund_pools 接口之后添加 ...
+
+@router.get("/api/reports/subsidy/weekly", response_model=ResponseModel, summary="周补贴明细报表")
+async def get_weekly_subsidy_report(
+        year: int = Query(..., ge=2024, description="年份，如2025"),
+        week: int = Query(..., ge=1, le=53, description="周数，1-53"),
+        user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """查询指定周次的补贴发放明细
+
+    可按用户筛选，支持分页。返回汇总统计和明细列表。
+    """
+    try:
+        data = service.get_weekly_subsidy_report(year, week, user_id, page, page_size)
+        return ResponseModel(
+            success=True,
+            message=f"周补贴报表查询成功: {data['summary']['query_week']}",
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"周补贴报表查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/reports/subsidy/monthly", response_model=ResponseModel, summary="月补贴明细报表")
+async def get_monthly_subsidy_report(
+        year: int = Query(..., ge=2024, description="年份，如2025"),
+        month: int = Query(..., ge=1, le=12, description="月份，1-12"),
+        user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """查询指定月份的补贴发放明细
+
+    显示该月内所有周次的补贴记录，可按用户筛选，支持分页。
+    """
+    try:
+        data = service.get_monthly_subsidy_report(year, month, user_id, page, page_size)
+        return ResponseModel(
+            success=True,
+            message=f"月补贴报表查询成功: {data['summary']['query_month']}",
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"月补贴报表查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# api/finance/routes.py
+
+# ... 在 subsidy/monthly 接口之后添加 ...
+
+@router.get("/api/reports/points/member/weekly", response_model=ResponseModel, summary="用户积分周报表")
+async def get_weekly_member_points_report(
+        year: int = Query(..., ge=2024, description="年份，如2025"),
+        week: int = Query(..., ge=1, le=53, description="周数，1-53"),
+        user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """查询指定周次的用户积分变动明细"""
+    try:
+        data = service.get_weekly_member_points_report(year, week, user_id, page, page_size)
+        return ResponseModel(
+            success=True,
+            message=f"用户积分周报表查询成功: {data['summary']['query_week']}",
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"用户积分周报表查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/reports/points/member/monthly", response_model=ResponseModel, summary="用户积分月报表")
+async def get_monthly_member_points_report(
+        year: int = Query(..., ge=2024, description="年份，如2025"),
+        month: int = Query(..., ge=1, le=12, description="月份，1-12"),
+        user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """查询指定月份的用户积分变动明细"""
+    try:
+        data = service.get_monthly_member_points_report(year, month, user_id, page, page_size)
+        return ResponseModel(
+            success=True,
+            message=f"用户积分月报表查询成功: {data['summary']['query_month']}",
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"用户积分月报表查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/reports/points/merchant/weekly", response_model=ResponseModel, summary="商家积分周报表")
+async def get_weekly_merchant_points_report(
+        year: int = Query(..., ge=2024, description="年份，如2025"),
+        week: int = Query(..., ge=1, le=53, description="周数，1-53"),
+        user_id: Optional[int] = Query(None, gt=0, description="商家用户ID（可选）"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """查询指定周次的商家积分变动明细"""
+    try:
+        data = service.get_weekly_merchant_points_report(year, week, user_id, page, page_size)
+        return ResponseModel(
+            success=True,
+            message=f"商家积分周报表查询成功: {data['summary']['query_week']}",
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"商家积分周报表查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/reports/points/merchant/monthly", response_model=ResponseModel, summary="商家积分月报表")
+async def get_monthly_merchant_points_report(
+        year: int = Query(..., ge=2024, description="年份，如2025"),
+        month: int = Query(..., ge=1, le=12, description="月份，1-12"),
+        user_id: Optional[int] = Query(None, gt=0, description="商家用户ID（可选）"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """查询指定月份的商家积分变动明细"""
+    try:
+        data = service.get_monthly_merchant_points_report(year, month, user_id, page, page_size)
+        return ResponseModel(
+            success=True,
+            message=f"商家积分月报表查询成功: {data['summary']['query_month']}",
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"商家积分月报表查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])
