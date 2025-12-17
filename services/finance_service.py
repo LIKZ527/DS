@@ -1883,7 +1883,648 @@ class FinanceService:
             logger.error(f"清空资金池失败: {e}", exc_info=True)
             raise
 
+    # services/finance_service.py
 
+    # ... 在 clear_fund_pools 方法之后添加 ...
+
+    def get_weekly_subsidy_report(self, year: int, week: int, user_id: Optional[int] = None,
+                                  page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """周补贴明细报表
+
+        查询指定年份和周数的补贴发放明细
+
+        Args:
+            year: 年份，如2025
+            week: 周数，1-53
+            user_id: 用户ID（可选）
+            page: 页码
+            page_size: 每页条数
+
+        Returns:
+            包含汇总、分页和明细的字典
+        """
+        logger.info(f"生成周补贴报表: {year}年第{week}周")
+
+        # 计算周的开始和结束日期
+        from datetime import date, timedelta
+
+        # 找到该年的第一天
+        first_day = date(year, 1, 1)
+        # 调整到第一个周一（如果1月1日不是周一）
+        if first_day.weekday() > 0:  # 0是周一，6是周日
+            first_day += timedelta(days=7 - first_day.weekday())
+        elif first_day.weekday() == 6:  # 如果是周日
+            first_day += timedelta(days=1)
+
+        # 计算目标周的开始日期
+        week_start = first_day + timedelta(weeks=week - 1)
+        week_end = week_start + timedelta(days=6)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 构建WHERE条件
+                where_conditions = ["wsr.week_start BETWEEN %s AND %s"]
+                params = [week_start, week_end]
+
+                if user_id:
+                    where_conditions.append("wsr.user_id = %s")
+                    params.append(user_id)
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 总记录数查询
+                count_sql = f"""
+                    SELECT COUNT(*) as total 
+                    FROM weekly_subsidy_records wsr 
+                    WHERE {where_sql}
+                """
+                cur.execute(count_sql, tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 明细查询
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT wsr.user_id, u.name as user_name, wsr.week_start,
+                           wsr.subsidy_amount, wsr.points_before, wsr.points_deducted,
+                           wsr.coupon_id
+                    FROM weekly_subsidy_records wsr
+                    JOIN users u ON wsr.user_id = u.id
+                    WHERE {where_sql}
+                    ORDER BY wsr.user_id, wsr.week_start DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                # 汇总统计
+                summary_sql = f"""
+                    SELECT COUNT(DISTINCT wsr.user_id) as total_users,
+                           SUM(wsr.subsidy_amount) as total_subsidy_amount,
+                           SUM(wsr.points_deducted) as total_points_deducted
+                    FROM weekly_subsidy_records wsr
+                    WHERE {where_sql.replace(' AND wsr.user_id = %s', '') if user_id else where_sql}
+                """
+                # 如果按用户查询，汇总统计需要去掉user_id条件
+                if user_id:
+                    cur.execute(summary_sql, (week_start, week_end))
+                else:
+                    cur.execute(summary_sql, tuple(params[:-2]))
+                summary = cur.fetchone()
+
+                return {
+                    "summary": {
+                        "query_week": f"{year}-W{week:02d}",
+                        "week_start": week_start.strftime("%Y-%m-%d"),
+                        "week_end": week_end.strftime("%Y-%m-%d"),
+                        "total_users": summary['total_users'] or 0,
+                        "total_subsidy_amount": float(summary['total_subsidy_amount'] or 0),
+                        "total_points_deducted": float(summary['total_points_deducted'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": [
+                        {
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "week_start": r['week_start'].strftime("%Y-%m-%d"),
+                            "subsidy_amount": float(r['subsidy_amount'] or 0),
+                            "points_before": float(r['points_before'] or 0),
+                            "points_deducted": float(r['points_deducted'] or 0),
+                            "points_after": float((r['points_before'] or 0) - (r['points_deducted'] or 0)),
+                            "coupon_id": r['coupon_id'],
+                            "remark": f"发放补贴¥{float(r['subsidy_amount'] or 0):.2f}，扣减点数{float(r['points_deducted'] or 0):.4f}"
+                        } for r in records
+                    ]
+                }
+
+    def get_monthly_subsidy_report(self, year: int, month: int, user_id: Optional[int] = None,
+                                   page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """月补贴明细报表
+
+        查询指定年月的补贴发放明细（按周汇总）
+
+        Args:
+            year: 年份，如2025
+            month: 月份，1-12
+            user_id: 用户ID（可选）
+            page: 页码
+            page_size: 每页条数
+
+        Returns:
+            包含汇总、分页和明细的字典
+        """
+        logger.info(f"生成月补贴报表: {year}年{month}月")
+
+        from datetime import date
+        import calendar
+
+        # 计算月的开始和结束日期
+        _, last_day = calendar.monthrange(year, month)
+        month_start = date(year, month, 1)
+        month_end = date(year, month, last_day)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 构建WHERE条件
+                where_conditions = ["wsr.week_start BETWEEN %s AND %s"]
+                params = [month_start, month_end]
+
+                if user_id:
+                    where_conditions.append("wsr.user_id = %s")
+                    params.append(user_id)
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 总记录数查询
+                count_sql = f"""
+                    SELECT COUNT(*) as total 
+                    FROM weekly_subsidy_records wsr 
+                    WHERE {where_sql}
+                """
+                cur.execute(count_sql, tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 明细查询
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT wsr.user_id, u.name as user_name, wsr.week_start,
+                           wsr.subsidy_amount, wsr.points_before, wsr.points_deducted,
+                           wsr.coupon_id
+                    FROM weekly_subsidy_records wsr
+                    JOIN users u ON wsr.user_id = u.id
+                    WHERE {where_sql}
+                    ORDER BY wsr.user_id, wsr.week_start DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                # 汇总统计
+                summary_sql = f"""
+                    SELECT COUNT(DISTINCT wsr.user_id) as total_users,
+                           SUM(wsr.subsidy_amount) as total_subsidy_amount,
+                           SUM(wsr.points_deducted) as total_points_deducted
+                    FROM weekly_subsidy_records wsr
+                    WHERE {where_sql.replace(' AND wsr.user_id = %s', '') if user_id else where_sql}
+                """
+                if user_id:
+                    cur.execute(summary_sql, (month_start, month_end))
+                else:
+                    cur.execute(summary_sql, tuple(params[:-2]))
+                summary = cur.fetchone()
+
+                return {
+                    "summary": {
+                        "query_month": f"{year}-{month:02d}",
+                        "month_start": month_start.strftime("%Y-%m-%d"),
+                        "month_end": month_end.strftime("%Y-%m-%d"),
+                        "total_users": summary['total_users'] or 0,
+                        "total_subsidy_amount": float(summary['total_subsidy_amount'] or 0),
+                        "total_points_deducted": float(summary['total_points_deducted'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": [
+                        {
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "week_start": r['week_start'].strftime("%Y-%m-%d"),
+                            "subsidy_amount": float(r['subsidy_amount'] or 0),
+                            "points_before": float(r['points_before'] or 0),
+                            "points_deducted": float(r['points_deducted'] or 0),
+                            "points_after": float((r['points_before'] or 0) - (r['points_deducted'] or 0)),
+                            "coupon_id": r['coupon_id'],
+                            "remark": f"发放补贴¥{float(r['subsidy_amount'] or 0):.2f}，扣减点数{float(r['points_deducted'] or 0):.4f}"
+                        } for r in records
+                    ]
+                }
+
+    # services/finance_service.py
+
+    # ... 在 get_monthly_subsidy_report 方法之后添加 ...
+
+    def get_weekly_member_points_report(self, year: int, week: int, user_id: Optional[int] = None,
+                                        page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """用户积分周报表
+
+        查询指定周次内用户member_points的变动明细
+
+        Args:
+            year: 年份，如2025
+            week: 周数，1-53
+            user_id: 用户ID（可选）
+            page: 页码
+            page_size: 每页条数
+
+        Returns:
+            包含汇总、分页和明细的字典
+        """
+        logger.info(f"生成用户积分周报表: {year}年第{week}周")
+
+        from datetime import date, timedelta
+
+        # 计算周的开始和结束日期
+        first_day = date(year, 1, 1)
+        if first_day.weekday() > 0:
+            first_day += timedelta(days=7 - first_day.weekday())
+        elif first_day.weekday() == 6:
+            first_day += timedelta(days=1)
+
+        week_start = first_day + timedelta(weeks=week - 1)
+        week_end = week_start + timedelta(days=6)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 构建WHERE条件
+                where_conditions = ["DATE(pl.created_at) BETWEEN %s AND %s", "pl.type = 'member'"]
+                params = [week_start, week_end]
+
+                if user_id:
+                    where_conditions.append("pl.user_id = %s")
+                    params.append(user_id)
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 总记录数查询
+                count_sql = f"""
+                    SELECT COUNT(*) as total 
+                    FROM points_log pl
+                    WHERE {where_sql}
+                """
+                cur.execute(count_sql, tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 明细查询
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT pl.id, pl.user_id, u.name as user_name,
+                           pl.change_amount, pl.balance_after, pl.reason,
+                           pl.related_order, pl.created_at
+                    FROM points_log pl
+                    JOIN users u ON pl.user_id = u.id
+                    WHERE {where_sql}
+                    ORDER BY pl.user_id, pl.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                # 汇总统计
+                summary_sql = f"""
+                    SELECT COUNT(DISTINCT pl.user_id) as total_users,
+                           SUM(CASE WHEN pl.change_amount > 0 THEN pl.change_amount ELSE 0 END) as total_income,
+                           SUM(CASE WHEN pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as total_expense,
+                           SUM(pl.change_amount) as net_change
+                    FROM points_log pl
+                    WHERE {where_sql.replace(' AND pl.user_id = %s', '') if user_id else where_sql}
+                """
+                if user_id:
+                    cur.execute(summary_sql, (week_start, week_end))
+                else:
+                    cur.execute(summary_sql, tuple(params[:-2]))
+                summary = cur.fetchone()
+
+                return {
+                    "summary": {
+                        "report_type": "member_points_weekly",
+                        "query_week": f"{year}-W{week:02d}",
+                        "week_start": week_start.strftime("%Y-%m-%d"),
+                        "week_end": week_end.strftime("%Y-%m-%d"),
+                        "total_users": summary['total_users'] or 0,
+                        "total_income": float(summary['total_income'] or 0),
+                        "total_expense": float(summary['total_expense'] or 0),
+                        "net_change": float(summary['net_change'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": [
+                        {
+                            "log_id": r['id'],
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "change_amount": float(r['change_amount'] or 0),
+                            "balance_after": float(r['balance_after'] or 0),
+                            "reason": r['reason'],
+                            "related_order": r['related_order'],
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                            "flow_type": "收入" if r['change_amount'] > 0 else "支出"
+                        } for r in records
+                    ]
+                }
+
+    def get_monthly_member_points_report(self, year: int, month: int, user_id: Optional[int] = None,
+                                         page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """用户积分月报表
+
+        查询指定年月内用户member_points的变动明细
+
+        Args:
+            year: 年份，如2025
+            month: 月份，1-12
+            user_id: 用户ID（可选）
+            page: 页码
+            page_size: 每页条数
+
+        Returns:
+            包含汇总、分页和明细的字典
+        """
+        logger.info(f"生成用户积分月报表: {year}年{month}月")
+
+        from datetime import date
+        import calendar
+
+        # 计算月的开始和结束日期
+        _, last_day = calendar.monthrange(year, month)
+        month_start = date(year, month, 1)
+        month_end = date(year, month, last_day)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 构建WHERE条件
+                where_conditions = ["DATE(pl.created_at) BETWEEN %s AND %s", "pl.type = 'member'"]
+                params = [month_start, month_end]
+
+                if user_id:
+                    where_conditions.append("pl.user_id = %s")
+                    params.append(user_id)
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 总记录数查询
+                count_sql = f"""
+                    SELECT COUNT(*) as total 
+                    FROM points_log pl
+                    WHERE {where_sql}
+                """
+                cur.execute(count_sql, tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 明细查询
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT pl.id, pl.user_id, u.name as user_name,
+                           pl.change_amount, pl.balance_after, pl.reason,
+                           pl.related_order, pl.created_at
+                    FROM points_log pl
+                    JOIN users u ON pl.user_id = u.id
+                    WHERE {where_sql}
+                    ORDER BY pl.user_id, pl.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                # 汇总统计
+                summary_sql = f"""
+                    SELECT COUNT(DISTINCT pl.user_id) as total_users,
+                           SUM(CASE WHEN pl.change_amount > 0 THEN pl.change_amount ELSE 0 END) as total_income,
+                           SUM(CASE WHEN pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as total_expense,
+                           SUM(pl.change_amount) as net_change
+                    FROM points_log pl
+                    WHERE {where_sql.replace(' AND pl.user_id = %s', '') if user_id else where_sql}
+                """
+                if user_id:
+                    cur.execute(summary_sql, (month_start, month_end))
+                else:
+                    cur.execute(summary_sql, tuple(params[:-2]))
+                summary = cur.fetchone()
+
+                return {
+                    "summary": {
+                        "report_type": "member_points_monthly",
+                        "query_month": f"{year}-{month:02d}",
+                        "month_start": month_start.strftime("%Y-%m-%d"),
+                        "month_end": month_end.strftime("%Y-%m-%d"),
+                        "total_users": summary['total_users'] or 0,
+                        "total_income": float(summary['total_income'] or 0),
+                        "total_expense": float(summary['total_expense'] or 0),
+                        "net_change": float(summary['net_change'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": [
+                        {
+                            "log_id": r['id'],
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "change_amount": float(r['change_amount'] or 0),
+                            "balance_after": float(r['balance_after'] or 0),
+                            "reason": r['reason'],
+                            "related_order": r['related_order'],
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                            "flow_type": "收入" if r['change_amount'] > 0 else "支出"
+                        } for r in records
+                    ]
+                }
+
+    def get_weekly_merchant_points_report(self, year: int, week: int, user_id: Optional[int] = None,
+                                          page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """商家积分周报表
+
+        查询指定周次内商家merchant_points的变动明细
+        """
+        logger.info(f"生成商家积分周报表: {year}年第{week}周")
+
+        from datetime import date, timedelta
+
+        first_day = date(year, 1, 1)
+        if first_day.weekday() > 0:
+            first_day += timedelta(days=7 - first_day.weekday())
+        elif first_day.weekday() == 6:
+            first_day += timedelta(days=1)
+
+        week_start = first_day + timedelta(weeks=week - 1)
+        week_end = week_start + timedelta(days=6)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                where_conditions = ["DATE(pl.created_at) BETWEEN %s AND %s", "pl.type = 'merchant'"]
+                params = [week_start, week_end]
+
+                if user_id:
+                    where_conditions.append("pl.user_id = %s")
+                    params.append(user_id)
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 总记录数
+                count_sql = f"SELECT COUNT(*) as total FROM points_log pl WHERE {where_sql}"
+                cur.execute(count_sql, tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 明细
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT pl.id, pl.user_id, u.name as user_name,
+                           pl.change_amount, pl.balance_after, pl.reason,
+                           pl.related_order, pl.created_at
+                    FROM points_log pl
+                    JOIN users u ON pl.user_id = u.id
+                    WHERE {where_sql}
+                    ORDER BY pl.user_id, pl.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                # 汇总
+                summary_sql = f"""
+                    SELECT COUNT(DISTINCT pl.user_id) as total_users,
+                           SUM(CASE WHEN pl.change_amount > 0 THEN pl.change_amount ELSE 0 END) as total_income,
+                           SUM(CASE WHEN pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as total_expense,
+                           SUM(pl.change_amount) as net_change
+                    FROM points_log pl
+                    WHERE {where_sql.replace(' AND pl.user_id = %s', '') if user_id else where_sql}
+                """
+                if user_id:
+                    cur.execute(summary_sql, (week_start, week_end))
+                else:
+                    cur.execute(summary_sql, tuple(params[:-2]))
+                summary = cur.fetchone()
+
+                return {
+                    "summary": {
+                        "report_type": "merchant_points_weekly",
+                        "query_week": f"{year}-W{week:02d}",
+                        "week_start": week_start.strftime("%Y-%m-%d"),
+                        "week_end": week_end.strftime("%Y-%m-%d"),
+                        "total_users": summary['total_users'] or 0,
+                        "total_income": float(summary['total_income'] or 0),
+                        "total_expense": float(summary['total_expense'] or 0),
+                        "net_change": float(summary['net_change'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": [
+                        {
+                            "log_id": r['id'],
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "change_amount": float(r['change_amount'] or 0),
+                            "balance_after": float(r['balance_after'] or 0),
+                            "reason": r['reason'],
+                            "related_order": r['related_order'],
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                            "flow_type": "收入" if r['change_amount'] > 0 else "支出"
+                        } for r in records
+                    ]
+                }
+
+    def get_monthly_merchant_points_report(self, year: int, month: int, user_id: Optional[int] = None,
+                                           page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """商家积分月报表"""
+        logger.info(f"生成商家积分月报表: {year}年{month}月")
+
+        from datetime import date
+        import calendar
+
+        _, last_day = calendar.monthrange(year, month)
+        month_start = date(year, month, 1)
+        month_end = date(year, month, last_day)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                where_conditions = ["DATE(pl.created_at) BETWEEN %s AND %s", "pl.type = 'merchant'"]
+                params = [month_start, month_end]
+
+                if user_id:
+                    where_conditions.append("pl.user_id = %s")
+                    params.append(user_id)
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 总记录数
+                count_sql = f"SELECT COUNT(*) as total FROM points_log pl WHERE {where_sql}"
+                cur.execute(count_sql, tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 明细
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT pl.id, pl.user_id, u.name as user_name,
+                           pl.change_amount, pl.balance_after, pl.reason,
+                           pl.related_order, pl.created_at
+                    FROM points_log pl
+                    JOIN users u ON pl.user_id = u.id
+                    WHERE {where_sql}
+                    ORDER BY pl.user_id, pl.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                # 汇总
+                summary_sql = f"""
+                    SELECT COUNT(DISTINCT pl.user_id) as total_users,
+                           SUM(CASE WHEN pl.change_amount > 0 THEN pl.change_amount ELSE 0 END) as total_income,
+                           SUM(CASE WHEN pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as total_expense,
+                           SUM(pl.change_amount) as net_change
+                    FROM points_log pl
+                    WHERE {where_sql.replace(' AND pl.user_id = %s', '') if user_id else where_sql}
+                """
+                if user_id:
+                    cur.execute(summary_sql, (month_start, month_end))
+                else:
+                    cur.execute(summary_sql, tuple(params[:-2]))
+                summary = cur.fetchone()
+
+                return {
+                    "summary": {
+                        "report_type": "merchant_points_monthly",
+                        "query_month": f"{year}-{month:02d}",
+                        "month_start": month_start.strftime("%Y-%m-%d"),
+                        "month_end": month_end.strftime("%Y-%m-%d"),
+                        "total_users": summary['total_users'] or 0,
+                        "total_income": float(summary['total_income'] or 0),
+                        "total_expense": float(summary['total_expense'] or 0),
+                        "net_change": float(summary['net_change'] or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": [
+                        {
+                            "log_id": r['id'],
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "change_amount": float(r['change_amount'] or 0),
+                            "balance_after": float(r['balance_after'] or 0),
+                            "reason": r['reason'],
+                            "related_order": r['related_order'],
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                            "flow_type": "收入" if r['change_amount'] > 0 else "支出"
+                        } for r in records
+                    ]
+                }
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
 def _build_team_rewards_select(cursor, asset_fields: List[str] = None) -> tuple:
