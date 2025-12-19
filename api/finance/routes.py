@@ -712,7 +712,101 @@ async def clear_fund_pools(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# api/finance/routes.py
+# ==================== 1. 优惠券发放接口 ====================
+@router.post("/api/coupons/distribute", response_model=ResponseModel, summary="直接发放优惠券")
+async def distribute_coupon(
+    user_id: int = Query(..., gt=0, description="用户ID"),
+    amount: float = Query(..., gt=0, description="优惠券金额"),
+    coupon_type: str = Query('user', pattern=r'^(user|merchant)$', description="优惠券类型"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """直接给用户发放优惠券，无需审核流程"""
+    try:
+        coupon_id = service.distribute_coupon_directly(user_id, amount, coupon_type)
+        return ResponseModel(
+            success=True,
+            message=f"优惠券发放成功",
+            data={"coupon_id": coupon_id, "amount": amount}
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"发放优惠券失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"发放失败: {str(e)}")
+
+
+# ==================== 2. 推荐奖励接口 ====================
+@router.get("/api/rewards/referral", response_model=ResponseModel, summary="查询推荐奖励")
+async def get_referral_rewards(
+    user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+    status: str = Query('pending', pattern=r'^(pending|approved|rejected|all)$', description="奖励状态"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询推荐奖励列表（支持筛选和分页）"""
+    try:
+        data = service.get_referral_rewards(user_id, status, page, page_size)
+        return ResponseModel(
+            success=True,
+            message="查询成功",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询推荐奖励失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 3. 推荐和团队奖励流水接口 ====================
+@router.get("/api/rewards/flow", response_model=ResponseModel, summary="奖励流水明细")
+async def get_reward_flow(
+    user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+    reward_type: Optional[str] = Query(None, pattern=r'^(referral|team)$', description="奖励类型"),
+    start_date: Optional[str] = Query(None, description="开始日期 yyyy-MM-dd"),
+    end_date: Optional[str] = Query(None, description="结束日期 yyyy-MM-dd"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询推荐和团队奖励流水明细（支持筛选和分页）"""
+    try:
+        data = service.get_reward_flow_report(
+            user_id=user_id,
+            reward_type=reward_type,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size
+        )
+        return ResponseModel(
+            success=True,
+            message="查询成功",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询奖励流水失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 9. 优惠券使用后消失接口 ====================
+@router.post("/api/coupons/use", response_model=ResponseModel, summary="使用优惠券")
+async def use_coupon(
+    coupon_id: int = Query(..., gt=0, description="优惠券ID"),
+    user_id: int = Query(..., gt=0, description="用户ID"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """使用优惠券，使其状态变为已使用（从列表消失）"""
+    try:
+        success = service.use_coupon(coupon_id, user_id)
+        if success:
+            return ResponseModel(success=True, message="优惠券使用成功")
+        else:
+            raise HTTPException(status_code=500, detail="优惠券使用失败")
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"使用优惠券失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ... 在 clear_fund_pools 接口之后添加 ...
 
