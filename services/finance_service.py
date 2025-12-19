@@ -1789,7 +1789,228 @@ class FinanceService:
                     "chain": chain
                 }
 
-    # services/finance_service.py
+    # ==================== 1. 优惠券直接发放 ====================
+    def distribute_coupon_directly(self, user_id: int, amount: float,
+                                   coupon_type: str = 'user',
+                                   valid_days: int = COUPON_VALID_DAYS) -> int:
+        """直接发放优惠券给用户（无需审核）"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    today = datetime.now().date()
+                    valid_to = today + timedelta(days=valid_days)
+
+                    cur.execute(
+                        """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
+                           VALUES (%s, %s, %s, %s, %s, 'unused')""",
+                        (user_id, coupon_type, Decimal(str(amount)), today, valid_to)
+                    )
+                    coupon_id = cur.lastrowid
+                    conn.commit()
+
+                    logger.debug(f"直接发放优惠券给用户{user_id}: ID={coupon_id}, 金额¥{amount}")
+                    return coupon_id
+
+        except Exception as e:
+            logger.error(f"❌ 直接发放优惠券失败: {e}")
+            raise FinanceException(f"发放失败: {e}")
+
+    # ==================== 2. 查询推荐奖励列表 ====================
+    def get_referral_rewards(self, user_id: Optional[int] = None,
+                             status: str = 'pending',
+                             page: int = 1,
+                             page_size: int = 20) -> Dict[str, Any]:
+        """查询推荐奖励列表（支持分页）"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 构建查询条件 - 使用表别名 pr. 避免歧义
+                where_conditions = ["pr.reward_type = 'referral'"]
+                params = []
+
+                if user_id:
+                    where_conditions.append("pr.user_id = %s")  # ✅ 明确指定表别名
+                    params.append(user_id)
+
+                if status != 'all':
+                    where_conditions.append("pr.status = %s")  # ✅ 明确指定表别名
+                    params.append(status)
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 查询总数 - 同样需要明确表别名
+                cur.execute(f"SELECT COUNT(*) as total FROM pending_rewards pr WHERE {where_sql}", tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 查询明细
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT pr.id, pr.user_id, u.name as user_name,
+                           pr.amount, pr.order_id, o.order_number,
+                           pr.status, pr.created_at
+                    FROM pending_rewards pr
+                    JOIN users u ON pr.user_id = u.id
+                    LEFT JOIN orders o ON pr.order_id = o.id
+                    WHERE {where_sql}
+                    ORDER BY pr.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                return {
+                    "total_count": total_count,
+                    "page": page,
+                    "page_size": page_size,
+                    "records": [
+                        {
+                            "reward_id": r['id'],
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "order_id": r['order_id'],
+                            "order_no": r['order_number'],
+                            "amount": float(r['amount']),
+                            "status": r['status'],
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                        } for r in records
+                    ]
+                }
+    # ==================== 3. 推荐和团队奖励流水合并查询 ====================
+    def get_reward_flow_report(self, user_id: Optional[int] = None,
+                               reward_type: Optional[str] = None,
+                               start_date: Optional[str] = None,
+                               end_date: Optional[str] = None,
+                               page: int = 1,
+                               page_size: int = 20) -> Dict[str, Any]:
+        """查询推荐和团队奖励流水明细（支持筛选和分页）"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 构建查询条件
+                where_conditions = []
+                params = []
+
+                if user_id:
+                    where_conditions.append("pr.user_id = %s")
+                    params.append(user_id)
+
+                if reward_type:
+                    where_conditions.append("pr.reward_type = %s")
+                    params.append(reward_type)
+
+                if start_date:
+                    where_conditions.append("DATE(pr.created_at) >= %s")
+                    params.append(start_date)
+
+                if end_date:
+                    where_conditions.append("DATE(pr.created_at) <= %s")
+                    params.append(end_date)
+
+                where_sql = " AND ".join(where_conditions) if where_conditions else "1=1"
+
+                # 查询总数
+                cur.execute(f"SELECT COUNT(*) as total FROM pending_rewards pr WHERE {where_sql}", tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 查询明细
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT pr.id, pr.user_id, u.name as user_name,
+                           pr.reward_type, pr.amount, pr.order_id, 
+                           o.order_number, pr.layer, pr.status, pr.created_at
+                    FROM pending_rewards pr
+                    JOIN users u ON pr.user_id = u.id
+                    LEFT JOIN orders o ON pr.order_id = o.id
+                    WHERE {where_sql}
+                    ORDER BY pr.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                records = cur.fetchall()
+
+                # 汇总统计
+                summary_sql = f"""
+                    SELECT 
+                        COUNT(*) as total_records,
+                        SUM(CASE WHEN reward_type = 'referral' THEN amount ELSE 0 END) as total_referral_amount,
+                        SUM(CASE WHEN reward_type = 'team' THEN amount ELSE 0 END) as total_team_amount,
+                        SUM(CASE WHEN status = 'approved' THEN amount ELSE 0 END) as total_approved_amount,
+                        SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END) as total_pending_amount
+                    FROM pending_rewards pr
+                    WHERE {where_sql}
+                """
+                cur.execute(summary_sql, tuple(params[:-2]))
+                summary = cur.fetchone()
+
+                return {
+                    "summary": {
+                        "total_records": summary['total_records'] or 0,
+                        "total_referral_amount": float(summary.get('total_referral_amount', 0) or 0),
+                        "total_team_amount": float(summary.get('total_team_amount', 0) or 0),
+                        "total_approved_amount": float(summary.get('total_approved_amount', 0) or 0),
+                        "total_pending_amount": float(summary.get('total_pending_amount', 0) or 0)
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": [
+                        {
+                            "reward_id": r['id'],
+                            "user_id": r['user_id'],
+                            "user_name": r['user_name'],
+                            "reward_type": r['reward_type'],
+                            "amount": float(r['amount']),
+                            "order_id": r['order_id'],
+                            "order_no": r['order_number'],
+                            "layer": r['layer'] if r['reward_type'] == 'team' else None,
+                            "status": r['status'],
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                        } for r in records
+                    ]
+                }
+
+    # ==================== 4. 优惠券使用（消失） ====================
+    def use_coupon(self, coupon_id: int, user_id: int) -> bool:
+        """使用优惠券（状态变为已使用，从列表消失）"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # 查询优惠券信息并锁定行
+                    cur.execute(
+                        """SELECT id, amount, status, valid_from, valid_to 
+                           FROM coupons 
+                           WHERE id = %s AND user_id = %s FOR UPDATE""",
+                        (coupon_id, user_id)
+                    )
+                    coupon = cur.fetchone()
+
+                    if not coupon:
+                        raise FinanceException("优惠券不存在")
+
+                    if coupon['status'] != 'unused':
+                        raise FinanceException("优惠券已使用或已过期")
+
+                    # 检查有效期
+                    today = datetime.now().date()
+                    if coupon['valid_from'] > today or coupon['valid_to'] < today:
+                        raise FinanceException("优惠券不在有效期内")
+
+                    # 更新为已使用状态
+                    cur.execute(
+                        "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s",
+                        (coupon_id,)
+                    )
+                    conn.commit()
+
+                    logger.debug(f"用户{user_id}使用优惠券{coupon_id}，金额¥{coupon['amount']}")
+                    return True
+
+        except Exception as e:
+            logger.error(f"❌ 使用优惠券失败: {e}")
+            raise
 
     def clear_fund_pools(self, pool_types: List[str]) -> Dict[str, Any]:
         """清空指定的资金池"""
