@@ -1,3 +1,4 @@
+from services.finance_service import FinanceService
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -10,8 +11,55 @@ import uuid
 from datetime import datetime, timedelta
 from enum import Enum
 import json
+import threading
+import time
 
 router = APIRouter()
+
+def _cancel_expire_orders():
+    """每分钟扫描一次，把过期的 pending_pay 订单取消"""
+    while True:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    now = datetime.now()
+                    cur.execute("""
+                        SELECT id, order_number
+                        FROM orders
+                        WHERE status='pending_pay'
+                          AND expire_at IS NOT NULL
+                          AND expire_at <= %s
+                    """, (now,))
+                    for o in cur.fetchall():
+                        oid, ono = o["id"], o["order_number"]
+
+                        # 回滚库存
+                        cur.execute(
+                            "SELECT product_id,quantity FROM order_items WHERE order_id=%s",
+                            (oid,)
+                        )
+                        for it in cur.fetchall():
+                            cur.execute(
+                                "UPDATE product_skus SET stock=stock+%s WHERE product_id=%s",
+                                (it["quantity"], it["product_id"])
+                            )
+
+                        # 改状态
+                        cur.execute(
+                            "UPDATE orders SET status='cancelled',updated_at=NOW() WHERE id=%s",
+                            (oid,)
+                        )
+                        print(f"[expire] 订单 {ono} 已自动取消")
+                    conn.commit()
+        except Exception as e:
+            print(f"[expire] error: {e}")
+        time.sleep(60)
+
+def start_order_expire_task():
+    """由 api.order 包初始化时调用一次即可"""
+    t = threading.Thread(target=_cancel_expire_orders, daemon=True)
+    t.start()
+    print("[expire] 订单过期守护线程已启动")
 
 class OrderManager:
     @staticmethod
@@ -92,16 +140,17 @@ class OrderManager:
                         user_id, order_number, total_amount, status, is_vip_item,
                         consignee_name, consignee_phone,
                         province, city, district, shipping_address, delivery_way,
-                        pay_way, auto_recv_time, refund_reason)
+                        pay_way, auto_recv_time, refund_reason, expire_at)
                     VALUES (%s, %s, %s, 'pending_pay', %s,
                             %s, %s, %s, %s, %s, %s, %s,
-                            'wechat', %s, %s)
+                            'wechat', %s, %s, %s)
                 """, (
                     user_id, order_number, total, has_vip,
                     consignee_name, consignee_phone,
                     province, city, district, shipping_address, delivery_way,
                     datetime.now() + timedelta(days=7),
-                    specifications
+                    specifications,
+                    datetime.now() + timedelta(hours=12)  
                 ))
                 oid = cur.lastrowid
 
@@ -287,9 +336,56 @@ def create_order(body: OrderCreate):
 
 @router.post("/pay", summary="订单支付")
 def order_pay(body: OrderPay):
+    """支付回调：完成财务结算后再把订单状态改为待发货"""
     if body.pay_way not in VALID_PAY_WAYS:
         raise HTTPException(status_code=422, detail="非法支付方式")
-    return {"ok": OrderManager.update_status(body.order_number, "pending_ship")}
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1. 取订单基本信息
+            cur.execute(
+                "SELECT id,user_id,total_amount,status,is_vip_item FROM orders WHERE order_number=%s",
+                (body.order_number,)
+            )
+            order = cur.fetchone()
+            if not order:
+                raise HTTPException(status_code=404, detail="订单不存在")
+            if order["status"] != "pending_pay":
+                raise HTTPException(status_code=400, detail="订单状态不是待付款")
+
+            user_id = order["user_id"]
+            total_amt = Decimal(str(order["total_amount"]))
+            is_vip = bool(order["is_vip_item"])
+
+            # 2. 取订单里第一件商品作为结算主体（兼容现有逻辑）
+            cur.execute(
+                "SELECT product_id,quantity FROM order_items WHERE order_id=%s LIMIT 1",
+                (order["id"],)
+            )
+            item = cur.fetchone()
+            if not item:
+                raise HTTPException(status_code=422, detail="订单无商品明细")
+            product_id = item["product_id"]
+            quantity   = item["quantity"]
+
+            # 3. 财务结算（内部自带事务）
+            fs = FinanceService()
+            # 普通商品可把积分抵扣除去，这里简化传 0
+            fs.settle_order(
+                order_no=body.order_number,
+                user_id=user_id,
+                product_id=product_id,
+                quantity=quantity,
+                points_to_use=Decimal("0")
+            )
+
+            # 4. 更新订单状态
+            ok = OrderManager.update_status(body.order_number, "pending_ship")
+            if not ok:
+                raise HTTPException(status_code=500, detail="订单状态更新失败")
+
+    return {"ok": True}
+
 
 @router.get("/{user_id}", summary="查询用户订单列表")
 def list_orders(user_id: int, status: Optional[str] = None):
@@ -305,3 +401,6 @@ def order_detail(order_number: str):
 @router.post("/status", summary="更新订单状态")
 def update_status(body: StatusUpdate):
     return {"ok": OrderManager.update_status(body.order_number, body.new_status, body.reason)}
+
+# 模块被导入时自动启动守护线程
+start_order_expire_task()
