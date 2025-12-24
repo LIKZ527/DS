@@ -94,10 +94,53 @@ class CartManager:
                 )
                 conn.commit()
                 return True
+            
+    @staticmethod
+    def decrease(
+        user_id: int,
+        product_id: int,
+        quantity: int = 1,
+        specifications: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        # 1. 把规格转成 JSON 字符串（None -> 'null'）
+        spec_str = json.dumps(specifications, ensure_ascii=False) if specifications else 'null'
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 2. 同为 NULL 或者 JSON 相等
+                cur.execute(
+                    "SELECT id, quantity FROM cart "
+                    "WHERE user_id = %s AND product_id = %s "
+                    "AND (specifications IS NULL AND %s = 'null' "
+                    "     OR JSON_CONTAINS(specifications, %s) AND JSON_CONTAINS(%s, specifications))",
+                    (user_id, product_id, spec_str, spec_str, spec_str)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False
+
+                new_qty = row["quantity"] - quantity
+                cart_id = row["id"]
+
+                if new_qty <= 0:
+                    cur.execute("DELETE FROM cart WHERE id = %s", (cart_id,))
+                else:
+                    cur.execute(
+                        "UPDATE cart SET quantity = %s WHERE id = %s",
+                        (new_qty, cart_id)
+                    )
+                conn.commit()
+                return True
 
 
 # ----------- 请求模型 -----------
 class CartAdd(BaseModel):
+    user_id: int
+    product_id: int
+    quantity: PositiveInt = 1
+    specifications: Optional[Dict[str, Any]] = None
+
+class CartDecrease(BaseModel):
     user_id: int
     product_id: int
     quantity: PositiveInt = 1
@@ -122,3 +165,15 @@ def get_cart(user_id: int):
 @router.delete("/{user_id}/{product_id}", summary="从购物车移除商品")
 def cart_remove(user_id: int, product_id: int):
     return {"ok": CartManager.remove(user_id, product_id)}
+
+@router.post("/decrease", summary="按规格扣减/移除购物车商品")
+def cart_decrease(body: CartDecrease):
+    ok = CartManager.decrease(
+        body.user_id,
+        body.product_id,
+        body.quantity,
+        body.specifications
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="购物车中未找到该商品/规格")
+    return {"ok": True}
