@@ -18,9 +18,7 @@ from core.logging import get_logger
 logger = get_logger(__name__)
 router = APIRouter()
 
-
 # 在 order.py 的 _cancel_expire_orders 函数中
-
 def _cancel_expire_orders():
     """每分钟扫描一次，把过期的 pending_pay 订单取消"""
     while True:
@@ -73,13 +71,11 @@ def _cancel_expire_orders():
             print(f"[expire] error: {e}")
         time.sleep(60)
 
-
 def start_order_expire_task():
     """由 api.order 包初始化时调用一次即可"""
     t = threading.Thread(target=_cancel_expire_orders, daemon=True)
     t.start()
     print("[expire] 订单过期守护线程已启动")
-
 
 class OrderManager:
     @staticmethod
@@ -119,7 +115,7 @@ class OrderManager:
                         # sku_id 可选：若未提供则回退查询该商品的首个 sku
                         sku_id = it.get("sku_id")
                         if not sku_id:
-                            cur.execute("SELECT id FROM product_skus WHERE product_id = %s LIMIT 1", (it["product_id"],))
+                            cur.execute("SELECT id FROM product_skus WHERE product_id = %s LIMIT 1", (it['product_id'],))
                             sku_row = cur.fetchone()
                             if sku_row:
                                 sku_id = sku_row.get('id')
@@ -203,15 +199,15 @@ class OrderManager:
 
                 for i in items:
                     cur.execute(
-                        f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE product_id=%s",
-                        (i['product_id'],)
+                        f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE id=%s",  # ✅ 使用 sku_id
+                        (i['sku_id'],)
                     )
                     result = cur.fetchone()
-                    product_stock = result.get('stock', 0) if result else 0
-                    if product_stock < i["quantity"]:
+                    current_stock = result.get('stock', 0) if result else 0
+                    if current_stock < i["quantity"]:
                         raise HTTPException(
                             status_code=400,
-                            detail=f"商品库存不足：商品ID {i['product_id']} 当前库存 {product_stock}，需要 {i['quantity']}"
+                            detail=f"商品库存不足：SKU ID {i['sku_id']} 当前库存 {current_stock}，需要 {i['quantity']}"
                         )
 
                 # ---------- 4. 写订单明细 ----------
@@ -231,8 +227,8 @@ class OrderManager:
                 if has_stock_field:
                     for i in items:
                         cur.execute(
-                            "UPDATE product_skus SET stock = stock - %s WHERE product_id = %s",
-                            (i["quantity"], i["product_id"])
+                            "UPDATE product_skus SET stock = stock - %s WHERE id = %s",  # ✅ 使用 sku_id
+                            (i["quantity"], i["sku_id"])
                         )
 
                 # ---------- 6. 清空购物车（仅购物车结算场景） ----------
@@ -368,7 +364,7 @@ class OrderManager:
 
     @staticmethod
     def update_status(order_number: str, new_status: str, reason: Optional[str] = None, external_conn=None) -> bool:
-        # 先读取订单当前状态与 id（避免直接覆盖导致无法得知旧状态）
+        # 先读取订单当前状态与id
         order_id = None
         old_status = None
 
@@ -407,7 +403,6 @@ class OrderManager:
                     order_id = res['id']
                     old_status = res['status']
 
-                    # 如果状态已经是目标状态，则视为成功（幂等）
                     if old_status == new_status:
                         return True
 
@@ -423,42 +418,13 @@ class OrderManager:
                     except Exception:
                         pass
 
-        # 如果状态从 pending_recv 变为 completed 时发放积分
-        if old_status == 'pending_recv' and new_status == 'completed':
-            try:
-                fs = FinanceService()
-                # 优先在传入的连接上执行发放（避免跨连接锁），否则创建新连接
-                if external_conn:
-                    cur = external_conn.cursor()
-                    try:
-                        cur.execute(
-                            "SELECT id FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE %s LIMIT 1",
-                            (order_id, "%确认收货%")
-                        )
-                        if cur.fetchone():
-                            logger.info(f"订单{order_number}积分已发放，跳过")
-                        else:
-                            if not fs.grant_points_on_receive(order_number, external_conn=external_conn):
-                                logger.error(f"订单{order_number}积分发放返回失败")
-                    finally:
-                        try:
-                            cur.close()
-                        except Exception:
-                            pass
-                else:
-                    with get_conn() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                "SELECT id FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE %s LIMIT 1",
-                                (order_id, "%确认收货%")
-                            )
-                            if cur.fetchone():
-                                logger.info(f"订单{order_number}积分已发放，跳过")
-                            else:
-                                if not fs.grant_points_on_receive(order_number, external_conn=conn):
-                                    logger.error(f"订单{order_number}积分发放返回失败")
-            except Exception as e:
-                logger.error(f"订单{order_number}确认收货后积分发放失败: {e}", exc_info=True)
+        # ✅ **移除**：积分已在支付时发放，确认收货后不再发放
+        # if old_status == 'pending_recv' and new_status == 'completed':
+        #     try:
+        #         fs = FinanceService()
+        #         fs.grant_points_on_receive(order_number, external_conn=external_conn)
+        #     except Exception as e:
+        #         logger.error(f"订单{order_number}确认收货后积分发放失败: {e}", exc_info=True)
 
         return True
 
@@ -508,7 +474,6 @@ def create_order(body: OrderCreate):
         raise HTTPException(status_code=422, detail="购物车为空或地址缺失")
     return {"order_number": no}
 
-
 @router.post("/pay", summary="订单支付")
 def order_pay(body: OrderPay):
     """支付回调：完成财务结算后再把订单状态改为待发货"""
@@ -532,24 +497,19 @@ def order_pay(body: OrderPay):
             total_amt = Decimal(str(order["total_amount"]))
             is_vip = bool(order["is_vip_item"])
 
-            # 2. 取订单里第一件商品作为结算主体
-            cur.execute(
-                "SELECT product_id,quantity FROM order_items WHERE order_id=%s LIMIT 1",
-                (order["id"],)
-            )
-            item = cur.fetchone()
-            if not item:
-                raise HTTPException(status_code=422, detail="订单无商品明细")
-            product_id = item["product_id"]
-            quantity = item["quantity"]
+            # 2. 获取order_id
+            cur.execute("SELECT id FROM orders WHERE order_number=%s", (body.order_number,))
+            order = cur.fetchone()
+            if not order:
+                raise HTTPException(status_code=404, detail="订单不存在")
+            order_id = order['id']
 
-            # 3. 处理优惠抵扣（积分 + 优惠券）
+            # 3. 处理优惠抵扣（积分 + 优惠券）—— 完全分离处理
             total_points_to_use = Decimal('0')
-            total_coupon_discount = Decimal('0')
+            coupon_amount = Decimal('0')
 
             # 3.1 处理积分抵扣
             if body.points_to_use and body.points_to_use > 0:
-                # 只读取用户积分用于快速校验（真正的扣减在 finance_service 中使用原子更新）
                 cur.execute(
                     "SELECT COALESCE(member_points, 0) as points FROM users WHERE id = %s",
                     (user_id,)
@@ -558,19 +518,11 @@ def order_pay(body: OrderPay):
                 if not user or Decimal(str(user['points'])) < body.points_to_use:
                     raise HTTPException(status_code=400, detail="积分余额不足")
 
-                # 积分抵扣金额
-                points_discount = body.points_to_use * POINTS_DISCOUNT_RATE
-
-                # ✅ 移除：50%限制检查
-                # if points_discount > total_amt * Decimal('0.5'):
-                #     raise HTTPException(status_code=400, detail="积分抵扣不能超过订单金额的50%")
-
                 total_points_to_use = body.points_to_use
-                logger.debug(f"用户{user_id}使用积分{total_points_to_use}分，抵扣金额¥{points_discount}")
+                logger.debug(f"用户{user_id}使用积分{total_points_to_use}分")
 
-            # 3.2 处理优惠券抵扣
+            # 3.2 处理优惠券抵扣（不转换为积分）
             if body.coupon_id:
-                # 原子性标记优惠券为已使用，避免长事务锁等待
                 cur.execute(
                     "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s AND user_id = %s AND status = 'unused'",
                     (body.coupon_id, user_id)
@@ -578,44 +530,23 @@ def order_pay(body: OrderPay):
                 if cur.rowcount == 0:
                     raise HTTPException(status_code=400, detail="优惠券不存在或已使用")
 
-                # 查询金额（更新成功则只有本事务拥有该券）
                 cur.execute("SELECT amount FROM coupons WHERE id = %s", (body.coupon_id,))
                 coupon = cur.fetchone()
                 coupon_amount = Decimal(str(coupon['amount']))
+                logger.debug(f"用户{user_id}使用优惠券#{body.coupon_id}: 金额¥{coupon_amount}")
 
-                # 将优惠券金额转换为等效积分数量
-                coupon_points = coupon_amount / POINTS_DISCOUNT_RATE if POINTS_DISCOUNT_RATE > 0 else Decimal('0')
-
-                # 累加到总积分抵扣
-                total_points_to_use += coupon_points
-                total_coupon_discount = coupon_amount
-
-                logger.debug(f"用户{user_id}使用优惠券#{body.coupon_id}: 金额¥{coupon_amount}, 等效积分{coupon_points}")
-
-            # ✅ 移除：总抵扣金额50%限制检查
-            # total_discount = (total_points_to_use * POINTS_DISCOUNT_RATE) + total_coupon_discount
-            # if total_discount > total_amt * Decimal('0.5'):
-            #     raise HTTPException(status_code=400, detail="总优惠金额不能超过订单金额的50%")
-
-            # 4. 财务结算（传入总积分抵扣量和优惠券抵扣金额，使用同一连接避免死锁）
+            # 4. 财务结算（传入分离的参数）
             fs = FinanceService()
             fs.settle_order(
                 order_no=body.order_number,
                 user_id=user_id,
-                product_id=product_id,
-                quantity=quantity,
-                points_to_use=total_points_to_use,
-                coupon_discount=total_coupon_discount,  # ✅ 新增：传递优惠券抵扣金额
-                external_conn=conn  # ✅ 关键修复：传递连接避免卡死
+                order_id=order_id,
+                points_to_use=total_points_to_use,  # 仅积分
+                coupon_discount=coupon_amount,  # 仅优惠券
+                external_conn=conn
             )
 
-            # 立即发放积分（取消“确认收货”延后发放机制）
-            try:
-                fs.grant_points_on_receive(body.order_number, external_conn=conn, require_completed=False)
-            except Exception as e:
-                logger.error(f"订单{body.order_number}支付后立即发放积分失败: {e}", exc_info=True)
-
-            # 5. 更新订单状态（在同一连接内执行，避免锁等待）
+            # 5. 更新订单状态
             ok = OrderManager.update_status(body.order_number, "pending_ship", external_conn=conn)
             if not ok:
                 raise HTTPException(status_code=500, detail="订单状态更新失败")
@@ -624,11 +555,9 @@ def order_pay(body: OrderPay):
 
     return {"ok": True}
 
-
 @router.get("/{user_id}", summary="查询用户订单列表")
 def list_orders(user_id: int, status: Optional[str] = None):
     return OrderManager.list_by_user(user_id, status)
-
 
 @router.get("/detail/{order_number}", summary="查询订单详情")
 def order_detail(order_number: str):
@@ -637,18 +566,12 @@ def order_detail(order_number: str):
         raise HTTPException(status_code=404, detail="订单不存在")
     return d
 
-
 @router.post("/status", summary="更新订单状态")
 def update_status(body: StatusUpdate):
     return {"ok": OrderManager.update_status(body.order_number, body.new_status, body.reason)}
 
-
 def auto_receive_task(db_cfg: dict = None):
-    """自动收货和结算守护进程
-
-    该函数会启动一个后台线程，每小时检查一次待收货订单，
-    如果订单超过自动收货时间，则自动完成订单并发放积分。
-    """
+    """自动收货守护进程（不再发放积分）"""
     import threading
     import time
     from datetime import datetime
@@ -669,24 +592,18 @@ def auto_receive_task(db_cfg: dict = None):
                             order_id = row["id"]
                             order_number = row["order_number"]
 
-                            # 更新订单状态
+                            # 更新订单状态为已完成
                             cur.execute(
                                 "UPDATE orders SET status='completed' WHERE id=%s",
                                 (order_id,)
                             )
 
-                            # ✅ 新增：确认收货后发放积分
-                            try:
-                                fs = FinanceService()
-                                # 使用同一连接调用grant_points_on_receive以避免死锁
-                                fs.grant_points_on_receive(order_number, external_conn=conn)
-                                logger.debug(
-                                    f"[auto_receive] 订单 {order_number} 已自动完成并发放积分。")
-                            except Exception as e:
-                                logger.error(
-                                    f"[auto_receive] 订单{order_number}积分发放失败: {e}",
-                                    exc_info=True
-                                )
+                            # ✅ **移除**：积分已在支付时发放，自动收货不再发放
+                            # try:
+                            #     fs = FinanceService()
+                            #     fs.grant_points_on_receive(order_number, external_conn=conn)
+                            # except Exception as e:
+                            #     logger.error(f"[auto_receive] 订单{order_number}积分发放失败: {e}", exc_info=True)
 
                             conn.commit()
                             logger.debug(f"[auto_receive] 订单 {order_number} 已自动完成。")
@@ -696,8 +613,7 @@ def auto_receive_task(db_cfg: dict = None):
 
     t = threading.Thread(target=run, daemon=True)
     t.start()
-    logger.info("自动收货守护进程已启动（包含积分发放）")
-
+    logger.info("自动收货守护进程已启动（不再发放积分）")
 
 # 模块被导入时自动启动守护线程
 start_order_expire_task()
