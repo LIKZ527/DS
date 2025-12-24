@@ -402,6 +402,11 @@ class OrderManager:
                     )
                     if cur.rowcount == 0:
                         return False
+                    # 确保在使用内部连接时提交更改
+                    try:
+                        conn.commit()
+                    except Exception:
+                        pass
 
         # 如果状态从 pending_recv 变为 completed 时发放积分
         if old_status == 'pending_recv' and new_status == 'completed':
@@ -412,8 +417,8 @@ class OrderManager:
                     cur = external_conn.cursor()
                     try:
                         cur.execute(
-                            "SELECT id FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE '%确认收货%' LIMIT 1",
-                            (order_id,)
+                            "SELECT id FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE %s LIMIT 1",
+                            (order_id, "%确认收货%")
                         )
                         if cur.fetchone():
                             logger.info(f"订单{order_number}积分已发放，跳过")
@@ -429,8 +434,8 @@ class OrderManager:
                     with get_conn() as conn:
                         with conn.cursor() as cur:
                             cur.execute(
-                                "SELECT id FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE '%确认收货%' LIMIT 1",
-                                (order_id,)
+                                "SELECT id FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE %s LIMIT 1",
+                                (order_id, "%确认收货%")
                             )
                             if cur.fetchone():
                                 logger.info(f"订单{order_number}积分已发放，跳过")

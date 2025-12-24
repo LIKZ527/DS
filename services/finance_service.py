@@ -432,23 +432,29 @@ class FinanceService:
                     SELECT %s, %s, (SELECT COALESCE(member_points,0) FROM users WHERE id = %s) + %s, 'member', %s, %s, NOW()
                     FROM DUAL
                     WHERE NOT EXISTS (
-                        SELECT 1 FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE '%确认收货%'
+                        SELECT 1 FROM points_log WHERE related_order = %s AND type = 'member' AND reason LIKE %s
                     )
                     LIMIT 1
                 """
                 cur.execute(insert_sql, (
                     user_id, points_earned, user_id, points_earned,
                     '购买商品获得积分（确认收货后）', order['id'],
-                    order['id']
+                    order['id'], "%确认收货%"
                 ))
 
                 if cur.rowcount == 1:
-                    # 刚刚插入了流水，随后更新用户余额
+                    # 刚刚插入了流水，随后原子性更新用户余额并读取更新后的余额
                     cur.execute(
                         "UPDATE users SET member_points = COALESCE(member_points,0) + %s WHERE id = %s",
                         (points_earned, user_id)
                     )
-                    logger.info(f"[积分发放] 成功: 订单{order_no} 用户{user_id} +{points_earned:.4f}分")
+                    # 读取更新后的余额以便记录和日志
+                    cur.execute(
+                        "SELECT COALESCE(member_points,0) AS member_points FROM users WHERE id = %s",
+                        (user_id,)
+                    )
+                    new_balance = Decimal(str(cur.fetchone().get('member_points', 0) or 0))
+                    logger.info(f"[积分发放] 成功: 订单{order_no} 用户{user_id} +{points_earned:.4f}分 (余额{new_balance:.4f})")
                 else:
                     logger.info(f"[积分发放] 跳过: 订单{order_no} 已存在积分流水，未重复发放")
 
@@ -511,17 +517,23 @@ class FinanceService:
 
             return True
 
-        try:
-            if external_conn:
-                with external_conn.cursor() as cur:
-                    return _process_points_and_rewards(cur)
-            else:
-                with get_conn() as conn:
-                    with conn.cursor() as cur:
+            try:
+                if external_conn:
+                    with external_conn.cursor() as cur:
                         return _process_points_and_rewards(cur)
-        except Exception as e:
-            logger.error(f"[积分/奖励发放] 失败: {e}", exc_info=True)
-            return False
+                else:
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            res = _process_points_and_rewards(cur)
+                        # 确保在使用内部连接时提交更改
+                        try:
+                            conn.commit()
+                        except Exception:
+                            pass
+                        return res
+            except Exception as e:
+                logger.error(f"[积分/奖励发放] 失败: {e}", exc_info=True)
+                return False
     # ==================== 创建待发放奖励（v2版本） ====================
     def _create_pending_rewards_v2(self, cur, order_id: int, buyer_id: int,
                                    old_level: int, new_level: int, final_amount: Decimal) -> None:
