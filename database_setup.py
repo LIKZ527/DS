@@ -173,6 +173,7 @@ class DatabaseManager:
                     account_name VARCHAR(100) NOT NULL,
                     account_type VARCHAR(50) UNIQUE NOT NULL,
                     balance DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+                    config_params JSON DEFAULT NULL COMMENT '资金池配置参数',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE KEY uk_account_type (account_type)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -477,6 +478,10 @@ class DatabaseManager:
             'cart': {
                 'specifications': 'specifications JSON DEFAULT NULL',
                 'sku_id': 'sku_id BIGINT UNSIGNED NULL',
+            },
+            # 联创星级分红手动调整配置字段
+            'finance_accounts': {
+                'config_params': "config_params JSON DEFAULT NULL COMMENT '资金池配置参数（如：fixed_amount_per_weight）'"
             }
         }
         
