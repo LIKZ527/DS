@@ -99,17 +99,70 @@ async def get_weekly_subsidy_preview(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/api/unilevel/dividend", response_model=ResponseModel, summary="发放联创星级分红（手动触发）")
-async def distribute_unilevel_dividend(
-    service: FinanceService = Depends(get_finance_service)
+# ========== 联创分红预览接口 ==========
+@router.get("/api/reports/unilevel/preview", summary="联创分红预览")
+async def get_unilevel_dividend_preview(
+        service: FinanceService = Depends(get_finance_service)
 ):
-    """手动触发联创星级分红发放"""
+    """计算并展示联创星级分红预览（每个权重的金额）"""
     try:
-        # 每次调用创建新实例避免连接污染
+        data = service.calculate_unilevel_dividend_preview()
+        return {
+            "success": True,
+            "message": "分红预览计算成功",
+            "data": data
+        }
+    except Exception as e:
+        logger.error(f"分红预览计算失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== 调整联创分红金额接口 ==========
+@router.post("/api/unilevel/adjust", summary="调整联创分红金额")
+async def adjust_unilevel_dividend(
+        amount_per_weight: Optional[float] = Query(None, ge=0, description="每个权重的分红金额（传入0或null取消调整）"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """手动调整联创星级分红金额（平台决策）"""
+    try:
+        # 如果传入0，视为取消调整
+        if amount_per_weight is not None and amount_per_weight <= 0:
+            amount_per_weight = None
+
+        success = service.adjust_unilevel_dividend_amount(amount_per_weight)
+
+        if amount_per_weight is None:
+            message = "已取消联创分红手动调整，恢复自动计算"
+        else:
+            message = f"联创分红金额已调整为: ¥{amount_per_weight:.4f}/权重"
+
+        return {
+            "success": True,
+            "message": message,
+            "data": {"amount_per_weight": amount_per_weight}
+        }
+    except Exception as e:
+        logger.error(f"调整分红金额失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== 执行联创分红接口（已增强） ==========
+@router.post("/api/unilevel/dividend", summary="发放联创星级分红（手动触发）")
+async def distribute_unilevel_dividend(
+        service: FinanceService = Depends(get_finance_service)
+):
+    """手动触发联创星级分红发放（优先使用手动调整值）"""
+    try:
         result = service.distribute_unilevel_dividend()
         if result:
-            return ResponseModel(success=True, message="联创星级分红发放成功")
-        return ResponseModel(success=False, message="分红发放失败或无符合条件的用户")
+            return {
+                "success": True,
+                "message": "联创星级分红发放成功"
+            }
+        return {
+            "success": False,
+            "message": "分红发放失败或无符合条件的用户"
+        }
     except Exception as e:
         logger.error(f"联创分红接口异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

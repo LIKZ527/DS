@@ -1753,11 +1753,152 @@ class FinanceService:
 
                 return result
 
-    def distribute_unilevel_dividend(self) -> bool:
-        """发放联创星级分红（手动触发）"""
-        logger.info("联创星级分红发放开始")
+    # ========== 完整函数 1：获取手动调整配置（辅助函数） ==========
+    def _get_adjusted_unilevel_amount(self) -> Optional[Decimal]:
+        """获取手动调整的联创分红金额配置"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT config_params FROM finance_accounts WHERE account_type = 'honor_director'"
+                    )
+                    row = cur.fetchone()
 
-        # ============= 关键修改：事务外查询数据 =============
+                    if row and row.get('config_params'):
+                        try:
+                            import json
+                            config = json.loads(row['config_params'])
+                            if 'fixed_amount_per_weight' in config:
+                                return Decimal(str(config['fixed_amount_per_weight']))
+                        except (json.JSONDecodeError, KeyError, TypeError):
+                            pass
+        except Exception as e:
+            logger.error(f"获取调整配置失败: {e}")
+        return None
+
+    # ========== 完整函数 2：计算联创星级分红预览 ==========
+    def calculate_unilevel_dividend_preview(self) -> Dict[str, Any]:
+        """
+        计算联创星级分红预览（展示每个权重的金额）
+
+        返回：
+        - 资金池余额
+        - 总权重（所有联创星级之和）
+        - 每个权重的自动计算金额
+        - 是否设置了手动调整
+        - 所有联创用户列表
+        """
+        logger.info("计算联创星级分红预览")
+
+        # 1. 查询分红池余额
+        pool_balance = self.get_account_balance('honor_director')
+
+        # 2. 查询所有联创用户
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT uu.user_id, uu.level, u.name, u.member_level
+                    FROM user_unilevel uu
+                    JOIN users u ON uu.user_id = u.id
+                    WHERE uu.level IN (1, 2, 3)
+                """)
+                unilevel_users = cur.fetchall()
+
+        if not unilevel_users:
+            return {
+                "pool_balance": float(pool_balance),
+                "total_weight": 0,
+                "amount_per_weight_auto": 0.0,
+                "user_count": 0,
+                "adjustment_configured": False,
+                "adjusted_amount": None,
+                "will_use_adjusted": False,
+                "users": []
+            }
+
+        # 3. 计算总权重
+        total_weight = sum(Decimal(str(user['level'])) for user in unilevel_users)
+
+        # 4. 自动计算每个权重金额
+        amount_per_weight_auto = pool_balance / total_weight if total_weight > 0 else Decimal('0')
+
+        # 5. 检查是否有手动调整配置
+        adjusted_amount = self._get_adjusted_unilevel_amount()
+
+        return {
+            "pool_balance": float(pool_balance),
+            "total_weight": int(total_weight),
+            "amount_per_weight_auto": float(amount_per_weight_auto),
+            "user_count": len(unilevel_users),
+            "adjustment_configured": adjusted_amount is not None,
+            "adjusted_amount": float(adjusted_amount) if adjusted_amount else None,
+            "will_use_adjusted": adjusted_amount is not None,
+            "users": [
+                {
+                    "user_id": user['user_id'],
+                    "user_name": user['name'],
+                    "unilevel_level": user['level'],
+                    "member_level": user['member_level'],
+                    "weight": int(user['level']),
+                    "estimated_dividend": float(
+                        amount_per_weight_auto * Decimal(str(user['level']))) if adjusted_amount is None else float(
+                        adjusted_amount * Decimal(str(user['level'])))
+                } for user in unilevel_users
+            ]
+        }
+
+    # ========== 完整函数 3：手动调整联创分红金额 ==========
+    def adjust_unilevel_dividend_amount(self, amount_per_weight: Optional[float] = None) -> bool:
+        """
+        手动调整联创星级分红金额
+
+        Args:
+            amount_per_weight: 每个权重的分红金额，传入None表示取消手动调整，恢复自动计算
+        """
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if amount_per_weight is None:
+                        # 取消调整
+                        cur.execute(
+                            "UPDATE finance_accounts SET config_params = NULL WHERE account_type = 'honor_director'"
+                        )
+                        logger.info("已取消联创分红手动调整，恢复自动计算")
+                    else:
+                        # 设置调整金额
+                        amount = Decimal(str(amount_per_weight))
+                        if amount < 0:
+                            raise FinanceException("分红金额不能为负数")
+
+                        import json
+                        config = json.dumps({"fixed_amount_per_weight": str(amount)})
+                        cur.execute(
+                            "UPDATE finance_accounts SET config_params = %s WHERE account_type = 'honor_director'",
+                            (config,)
+                        )
+                        logger.info(f"已设置联创分红手动调整: ¥{amount:.4f}/权重")
+
+                    conn.commit()
+
+            return True
+        except Exception as e:
+            logger.error(f"调整分红金额失败: {e}")
+            raise
+
+    def distribute_unilevel_dividend(self) -> bool:
+        """
+        发放联创星级分红（支持手动调整）
+
+        关键修改：
+        1. 检查手动调整配置
+        2. 优先使用手动调整的金额
+        3. 计算所需总额并检查余额
+        4. 执行分红发放
+        5. 成功后清除手动调整配置
+        """
+        logger.info("联创星级分红发放开始（检测手动调整配置）")
+
+        # 查询所有联创用户
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -1772,14 +1913,37 @@ class FinanceService:
             logger.warning("没有符合条件的联创用户")
             return False
 
+        # 计算总权重
         total_weight = sum(Decimal(str(user['level'])) for user in unilevel_users)
+
+        # 查询分红池余额
         pool_balance = self.get_account_balance('honor_director')
 
         if pool_balance <= 0:
-            logger.warning(f"联创分红资金池余额不足: ¥{pool_balance}")
+            logger.warning(f"联创分红池余额不足: ¥{pool_balance}")
             return False
 
-        # ============= 关键修改：使用 get_conn() 替代 self.session =============
+        # 检查手动调整配置
+        adjusted_amount = self._get_adjusted_unilevel_amount()
+
+        # 确定使用哪个金额
+        if adjusted_amount is not None:
+            amount_per_weight = adjusted_amount
+            total_required = amount_per_weight * total_weight
+
+            # 关键：检查余额是否足够
+            if total_required > pool_balance:
+                raise FinanceException(
+                    f"资金池余额不足。手动调整需要¥{total_required:.4f}，"
+                    f"当前余额¥{pool_balance:.4f}"
+                )
+
+            logger.info(f"使用手动调整金额: ¥{amount_per_weight:.4f}/权重")
+        else:
+            amount_per_weight = pool_balance / total_weight
+            logger.info(f"使用自动计算金额: ¥{amount_per_weight:.4f}/权重")
+
+        # 执行分红发放
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -1788,30 +1952,36 @@ class FinanceService:
                     for user in unilevel_users:
                         user_id = user['user_id']
                         weight = Decimal(str(user['level']))
+                        points_to_add = amount_per_weight * weight
 
-                        dividend_amount = pool_balance * weight / total_weight
-                        points_to_add = dividend_amount
-
+                        # 发放点数到 users.points
                         cur.execute(
                             "UPDATE users SET points = COALESCE(points, 0) + %s WHERE id = %s",
                             (points_to_add, user_id)
                         )
+
+                        # 同时更新真实总点数
                         cur.execute(
                             "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
                             (points_to_add, user_id)
                         )
+
                         # 记录流水
-                        cur.execute(
-                            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                            ('honor_director', user_id, points_to_add, 0, 'income',
-                             f"联创{weight}星级分红（权重{weight}/{total_weight}）")
-                        )
+                        cur.execute("""
+                            INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                        """, ('honor_director', user_id, points_to_add, 0, 'income',
+                              f"联创{weight}星级分红（权重{weight}/{total_weight}）"))
 
                         total_distributed += points_to_add
-                        logger.debug(f"用户{user_id}获得联创分红点数: {points_to_add:.4f}")
+                        logger.debug(f"用户{user_id}获得联创星级分红: {points_to_add:.4f}点数")
 
                     conn.commit()
+
+            # 分红成功后，清除手动调整配置（避免下次误用）
+            if adjusted_amount is not None:
+                logger.info("分红完成，清除手动调整配置")
+                self.adjust_unilevel_dividend_amount(None)
 
             logger.info(f"联创星级分红完成: 共{len(unilevel_users)}人，发放点数{total_distributed:.4f}")
             return True
@@ -2592,91 +2762,93 @@ class FinanceService:
                                         page: int = 1,
                                         page_size: int = 20) -> Dict[str, Any]:
         """
-        联创星级点数流水报表
+        联创星级点数流水报表（修正版：从account_flow表查询）
 
         查询联创会员的星级分红发放记录，支持按用户、星级、日期筛选
-
-        Args:
-            user_id: 用户ID（可选）
-            level: 星级（1-3，可选）
-            start_date: 开始日期 yyyy-MM-dd（可选）
-            end_date: 结束日期 yyyy-MM-dd（可选）
-            page: 页码
-            page_size: 每页条数
-
-        Returns:
-            包含汇总、分页和明细的字典
         """
         logger.info(f"生成联创星级点数流水报表: 用户={user_id}, 星级={level}, 日期范围={start_date}至{end_date}")
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 构建WHERE条件
-                where_conditions = []
-                params = []
+                # 构建WHERE条件（用于明细和汇总查询）
+                where_conditions = ["af.account_type = 'honor_director'", "af.flow_type = 'income'"]
+                query_params = []
 
                 if user_id:
-                    where_conditions.append("d.user_id = %s")
-                    params.append(user_id)
+                    where_conditions.append("af.related_user = %s")
+                    query_params.append(user_id)
 
                 if level:
-                    where_conditions.append("u.level = %s")
-                    params.append(level)
+                    where_conditions.append("uu.level = %s")
+                    query_params.append(level)
 
                 if start_date:
-                    where_conditions.append("DATE(d.created_at) >= %s")
-                    params.append(start_date)
+                    where_conditions.append("DATE(af.created_at) >= %s")
+                    query_params.append(start_date)
 
                 if end_date:
-                    where_conditions.append("DATE(d.created_at) <= %s")
-                    params.append(end_date)
+                    where_conditions.append("DATE(af.created_at) <= %s")
+                    query_params.append(end_date)
 
-                where_sql = " AND ".join(where_conditions) if where_conditions else "1=1"
+                where_sql = " AND ".join(where_conditions)
 
-                # 总记录数查询
+                # 1. 总记录数查询
                 count_sql = f"""
-                    SELECT COUNT(*) as total 
-                    FROM director_dividends d
-                    JOIN user_unilevel u ON d.user_id = u.user_id
+                    SELECT COUNT(*) as total
+                    FROM account_flow af
+                    JOIN user_unilevel uu ON af.related_user = uu.user_id
                     WHERE {where_sql}
                 """
-                cur.execute(count_sql, tuple(params))
+                cur.execute(count_sql, tuple(query_params))
                 total_count = cur.fetchone()['total'] or 0
 
-                # 明细查询
+                # 2. 明细查询（带分页）
                 offset = (page - 1) * page_size
+                detail_params = query_params + [page_size, offset]
                 detail_sql = f"""
-                    SELECT d.user_id, us.name as user_name, u.level as unilevel_level,
-                           d.dividend_amount, d.new_sales, d.weight, d.period_date, d.created_at
-                    FROM director_dividends d
-                    JOIN user_unilevel u ON d.user_id = u.user_id
-                    JOIN users us ON d.user_id = us.id
+                    SELECT af.id as flow_id, af.related_user as user_id, u.name as user_name,
+                           uu.level as unilevel_level, af.change_amount as points,
+                           af.created_at, af.remark
+                    FROM account_flow af
+                    JOIN users u ON af.related_user = u.id
+                    JOIN user_unilevel uu ON af.related_user = uu.user_id
                     WHERE {where_sql}
-                    ORDER BY d.period_date DESC, d.user_id
+                    ORDER BY af.created_at DESC, af.id DESC
                     LIMIT %s OFFSET %s
                 """
-                params.extend([page_size, offset])
-                cur.execute(detail_sql, tuple(params))
+                cur.execute(detail_sql, tuple(detail_params))
                 records = cur.fetchall()
 
-                # 汇总统计
+                # 3. 汇总统计（不包含user_id过滤条件）
+                summary_where = where_conditions.copy()
+                summary_params = query_params.copy()
+
+                # 移除user_id相关的条件（如果存在）
+                if user_id:
+                    user_idx = -1
+                    for idx, condition in enumerate(summary_where):
+                        if "af.related_user" in condition:
+                            user_idx = idx
+                            break
+                    if user_idx >= 0:
+                        summary_where.pop(user_idx)
+                        summary_params.pop(user_idx)
+
                 summary_sql = f"""
-                    SELECT COUNT(DISTINCT d.user_id) as total_users,
-                           SUM(d.dividend_amount) as total_dividend_amount,
-                           SUM(d.new_sales) as total_new_sales
-                    FROM director_dividends d
-                    JOIN user_unilevel u ON d.user_id = u.user_id
-                    WHERE {where_sql}
+                    SELECT COUNT(DISTINCT af.related_user) as total_users,
+                           SUM(af.change_amount) as total_dividend_amount
+                    FROM account_flow af
+                    JOIN user_unilevel uu ON af.related_user = uu.user_id
+                    WHERE {" AND ".join(summary_where)}
                 """
-                cur.execute(summary_sql, tuple(params[:-2]))
+                cur.execute(summary_sql, tuple(summary_params))
                 summary = cur.fetchone()
 
                 return {
                     "summary": {
                         "report_type": "unilevel_points_flow",
                         "total_users": summary['total_users'] or 0,
-                        "total_dividend_amount": float(summary['total_dividend_amount'] or 0),
-                        "total_new_sales": float(summary['total_new_sales'] or 0)
+                        "total_dividend_amount": float(summary['total_dividend_amount'] or 0)
                     },
                     "pagination": {
                         "page": page,
@@ -2686,16 +2858,15 @@ class FinanceService:
                     },
                     "records": [
                         {
+                            "flow_id": r['flow_id'],
                             "user_id": r['user_id'],
                             "user_name": r['user_name'],
                             "unilevel_level": r['unilevel_level'],
                             "level_name": f"{r['unilevel_level']}星级联创",
-                            "points": float(r['dividend_amount'] or 0),
-                            "new_sales": float(r['new_sales'] or 0),
-                            "weight": r['weight'] or 1,
-                            "period_date": r['period_date'].strftime("%Y-%m-%d"),
+                            "points": float(r['points'] or 0),
+                            "period_date": r['created_at'].strftime("%Y-%m-%d"),
                             "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
-                            "remark": f"{r['unilevel_level']}星级联创分红，权重{r['weight']}"
+                            "remark": r['remark']
                         } for r in records
                     ]
                 }
