@@ -160,3 +160,18 @@ CATEGORY_CHOICES: Final[list[str]] = [
     "服装鞋帽", "家居生活", "美妆护肤", "母婴用品",
     "食品饮料", "数码电器", "图书文具", "运动户外", "其他"
 ]
+
+
+# 添加审核状态枚举
+class AuditStatus(StrEnum):
+    SUBMITTED = "submitted"  # 已提交
+    AUDITING = "auditing"    # 审核中
+    APPROVED = "approved"    # 已通过
+    REJECTED = "rejected"    # 已驳回
+
+# 材料类型枚举
+class MaterialType(StrEnum):
+    BUSINESS_LICENSE = "BUSINESS_LICENSE"
+    LEGAL_PERSON_ID_CARD_FRONT = "LEGAL_PERSON_ID_CARD_FRONT"
+    LEGAL_PERSON_ID_CARD_BACK = "LEGAL_PERSON_ID_CARD_BACK"
+    AGENT_AUTHORIZATION = "AGENT_AUTHORIZATION"
