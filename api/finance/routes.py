@@ -136,12 +136,12 @@ async def get_weekly_subsidy_preview(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ========== 联创分红预览接口 ==========
-@router.get("/api/reports/unilevel/preview", summary="联创分红预览")
+# ========== 联创分红预览接口（已更新） ==========
+@router.get("/api/reports/unilevel/preview", summary="联创分红预览（含用户上限）")
 async def get_unilevel_dividend_preview(
         service: FinanceService = Depends(get_finance_service)
 ):
-    """计算并展示联创星级分红预览（每个权重的金额）"""
+    """计算并展示联创星级分红预览（每个权重的金额，含单个用户1万上限）"""
     try:
         data = service.calculate_unilevel_dividend_preview()
         return {
@@ -153,34 +153,45 @@ async def get_unilevel_dividend_preview(
         logger.error(f"分红预览计算失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ========== 调整联创分红金额接口 ==========
-@router.post("/api/unilevel/adjust", summary="调整联创分红金额")
+@router.post("/api/unilevel/adjust", response_model=ResponseModel, summary="调整联创分红金额（含上限预警）")
 async def adjust_unilevel_dividend(
         amount_per_weight: Optional[float] = Query(None, ge=0, description="每个权重的分红金额（传入0或null取消调整）"),
         service: FinanceService = Depends(get_finance_service)
 ):
-    """手动调整联创星级分红金额（平台决策）"""
+    """手动调整联创星级分红金额，如果存在用户会达到上限10,000元，将返回警告信息"""
     try:
         # 如果传入0，视为取消调整
         if amount_per_weight is not None and amount_per_weight <= 0:
             amount_per_weight = None
 
-        success = service.adjust_unilevel_dividend_amount(amount_per_weight)
+        result = service.adjust_unilevel_dividend_amount(amount_per_weight)
 
-        if amount_per_weight is None:
-            message = "已取消联创分红手动调整，恢复自动计算"
-        else:
-            message = f"联创分红金额已调整为: ¥{amount_per_weight:.4f}/权重"
-
-        return {
-            "success": True,
-            "message": message,
-            "data": {"amount_per_weight": amount_per_weight}
+        # 构建响应
+        response_data = {
+            "amount_per_weight": amount_per_weight,
+            "timestamp": datetime.now().isoformat()
         }
+
+        # 如果有警告信息，添加到响应
+        if result.get("warning"):
+            response_data["warning"] = result["warning"]
+            return ResponseModel(
+                success=True,
+                message=result["message"],
+                data=response_data
+            )
+        else:
+            return ResponseModel(
+                success=True,
+                message=result["message"],
+                data=response_data
+            )
+
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"调整分红金额失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"调整失败: {str(e)}")
 
 
 # ========== 执行联创分红接口（已增强） ==========
@@ -621,20 +632,27 @@ async def set_pool_allocations(
 
 
 # ==================== 1. 优惠券发放接口 ====================
+# 在优惠券发放接口中添加 applicable_product_type 参数
 @router.post("/api/coupons/distribute", response_model=ResponseModel, summary="直接发放优惠券")
 async def distribute_coupon(
     user_id: int = Query(..., gt=0, description="用户ID"),
     amount: float = Query(..., gt=0, description="优惠券金额"),
     coupon_type: str = Query('user', pattern=r'^(user|merchant)$', description="优惠券类型"),
+    applicable_product_type: str = Query('all', pattern=r'^(all|normal_only|member_only)$', description="适用商品范围：all=不限制，normal_only=仅普通商品，member_only=仅会员商品"),  # 新增参数
     service: FinanceService = Depends(get_finance_service)
 ):
     """直接给用户发放优惠券，需扣除等额的 true_total_points（1:1）"""
     try:
-        coupon_id = service.distribute_coupon_directly(user_id, amount, coupon_type)
+        coupon_id = service.distribute_coupon_directly(
+            user_id,
+            amount,
+            coupon_type,
+            applicable_product_type  # 传递新参数
+        )
         return ResponseModel(
             success=True,
             message=f"优惠券发放成功（已扣除 true_total_points ¥{amount:.4f}）",
-            data={"coupon_id": coupon_id, "amount": amount}
+            data={"coupon_id": coupon_id, "amount": amount, "applicable_product_type": applicable_product_type}
         )
     except FinanceException as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -694,18 +712,17 @@ async def get_reward_flow(
     except Exception as e:
         logger.error(f"查询奖励流水失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-
 # ==================== 9. 优惠券使用后消失接口 ====================
 @router.post("/api/coupons/use", response_model=ResponseModel, summary="使用优惠券")
 async def use_coupon(
     coupon_id: int = Query(..., gt=0, description="优惠券ID"),
     user_id: int = Query(..., gt=0, description="用户ID"),
+    order_type: Optional[str] = Query(None, pattern=r'^(normal|member)$', description="订单商品类型（可选，用于验证优惠券适用范围）"),  # 新增参数
     service: FinanceService = Depends(get_finance_service)
 ):
     """使用优惠券，使其状态变为已使用（从列表消失）"""
     try:
-        success = service.use_coupon(coupon_id, user_id)
+        success = service.use_coupon(coupon_id, user_id, order_type)  # 传递订单类型
         if success:
             return ResponseModel(success=True, message="优惠券使用成功")
         else:
@@ -715,9 +732,6 @@ async def use_coupon(
     except Exception as e:
         logger.error(f"使用优惠券失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-# ... 在 clear_fund_pools 接口之后添加 ...
-
 @router.get("/api/reports/subsidy/weekly", response_model=ResponseModel, summary="周补贴明细报表")
 async def get_weekly_subsidy_report(
         year: int = Query(..., ge=2024, description="年份，如2025"),
@@ -1035,6 +1049,74 @@ async def get_all_points_flow_report(
     except Exception as e:
         logger.error(f"查询综合点数流水报表失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+# ==================== 总会员积分明细报表接口 ====================
+@router.get("/api/reports/points/member/detail", response_model=ResponseModel, summary="总会员积分明细报表")
+async def get_member_points_detail_report(
+        user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选，查所有用户则留空）"),
+        start_date: Optional[str] = Query(None, description="开始日期 yyyy-MM-dd"),
+        end_date: Optional[str] = Query(None, description="结束日期 yyyy-MM-dd"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """
+    查询用户会员积分的详细流水
+
+    功能特点：
+    - 支持按用户ID、日期范围筛选
+    - 自动计算期初余额和期末余额
+    - 显示每条流水的收入/支出类型、金额、关联订单
+    - 提供汇总统计（总收入、总支出、净变动）
+    - 支持分页查询
+    """
+    try:
+        data = service.get_member_points_detail_report(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size
+        )
+
+        message = f"总会员积分明细报表查询成功"
+        if user_id:
+            message += f": 用户 {data['user_info']['user_name'] if data['user_info'] else user_id}"
+        message += f"，共 {len(data['records'])} 条记录"
+
+        return ResponseModel(
+            success=True,
+            message=message,
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"查询总会员积分明细报表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+@router.post("/api/donate/true-total-points", response_model=ResponseModel, summary="用户捐赠点数到公益基金")
+async def donate_true_total_points(
+    user_id: int = Query(..., gt=0, description="用户ID"),
+    amount: float = Query(..., gt=0, description="捐赠金额"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """
+    用户将 true_total_points 捐赠到公益基金账户
+    - 点数与资金1:1兑换
+    - 同时记录用户点数减少和公益基金增加的流水
+    - 可在公益基金流水中查询捐赠记录
+    """
+    try:
+        result = service.donate_true_total_points(user_id, amount)
+        return ResponseModel(
+            success=True,
+            message=result["message"],
+            data=result
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"捐赠接口异常: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"捐赠失败: {str(e)}")
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])

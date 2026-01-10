@@ -5,27 +5,94 @@ from typing import Final
 import os
 from dotenv import load_dotenv
 from pathlib import Path
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 # 加载环境变量
 load_dotenv()
 
 
+# ==================== 应用配置（使用 pydantic-settings） ====================
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # JWT
+    JWT_SECRET_KEY: SecretStr
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = 1440
+
+    ENABLE_UUID_AUTH: int = 0
+
+    # 应用级配置
+    UVICORN_PORT: int = 8000
+    DRAFT_EXPIRE_DAYS: int = 7
+    MAX_FILE_SIZE_MB: int = 10
+
+    # 数据库
+    MYSQL_HOST: str = "127.0.0.1"
+    MYSQL_PORT: int = 3306
+    MYSQL_USER: str
+    MYSQL_PASSWORD: str
+    MYSQL_DATABASE: str
+
+    # 微信/支付相关
+    WECHAT_APP_ID: str = ""
+    WECHAT_APP_SECRET: str = ""
+    WECHAT_PAY_MCH_ID: str = ""
+    WECHAT_PAY_API_V3_KEY: str = ""
+    WECHAT_PAY_API_CERT_PATH: str = ""
+    WECHAT_PAY_API_KEY_PATH: str = ""
+    WECHAT_PAY_PLATFORM_CERT_PATH: str = ""
+    WECHAT_PAY_PUBLIC_KEY_PATH: str = ""
+    WECHAT_PAY_NOTIFY_URL: str = ""
+
+    WX_MCHID: str | None = None
+    WX_CERT_SERIAL_NO: str = ""
+    WX_APIV3_KEY: str = ""
+    WX_PRIVATE_KEY_PATH: str = ""
+    WX_PAY_BASE_URL: str = "https://api.mch.weixin.qq.com"
+    WECHATPAY_CERT_PATH: str = ""
+    WX_WECHATPAY_SERIAL: str = ""
+
+    PUSH_TEMPLATE_ID_APPLYMENT: str = ""
+
+
+# 实例化设置
+settings = Settings()
+
+# ==================== JWT配置 ====================
+JWT_SECRET_KEY: Final[str] = settings.JWT_SECRET_KEY.get_secret_value()
+JWT_ALGORITHM: Final[str] = settings.JWT_ALGORITHM
+JWT_EXPIRE_MINUTES: Final[int] = settings.JWT_EXPIRE_MINUTES
+
+# 双认证开关
+ENABLE_UUID_AUTH: Final[int] = settings.ENABLE_UUID_AUTH
+
+# ==================== 应用配置 ====================
+UVICORN_PORT: int = settings.UVICORN_PORT
+DRAFT_EXPIRE_DAYS: int = settings.DRAFT_EXPIRE_DAYS
+MAX_FILE_SIZE_MB: int = settings.MAX_FILE_SIZE_MB
 
 # ==================== 数据库配置 ====================
 def get_db_config():
     """获取数据库配置字典"""
     cfg = {
-        'host': os.getenv('MYSQL_HOST', '127.0.0.1'),
-        'port': int(os.getenv('MYSQL_PORT', 3306)),
-        'user': os.getenv('MYSQL_USER'),
-        'password': os.getenv('MYSQL_PASSWORD'),
-        'database': os.getenv('MYSQL_DATABASE'),
+        'host': settings.MYSQL_HOST,
+        'port': int(settings.MYSQL_PORT),
+        'user': settings.MYSQL_USER,
+        'password': settings.MYSQL_PASSWORD,
+        'database': settings.MYSQL_DATABASE,
         'charset': 'utf8mb4',
     }
     missing = [k for k in ('user', 'password', 'database') if not cfg.get(k)]
     if missing:
         raise RuntimeError(f"缺少必要的数据库环境变量: {', '.join(missing)}\n")
     return cfg
-
 
 # ==================== 平台常量 ====================
 PLATFORM_MERCHANT_ID: Final[int] = 0
@@ -135,8 +202,8 @@ LOG_FILE: Final[Path] = LOG_DIR / 'api.log'
 LOG_DIR.mkdir(exist_ok=True)
 
 # ==================== 微信配置 ====================
-WECHAT_APP_ID: Final[str] = os.getenv('WECHAT_APP_ID', '')
-WECHAT_APP_SECRET: Final[str] = os.getenv('WECHAT_APP_SECRET', '')
+WECHAT_APP_ID: Final[str] = settings.WECHAT_APP_ID
+WECHAT_APP_SECRET: Final[str] = settings.WECHAT_APP_SECRET
 
 # ==================== 商品图片配置 ====================
 # 挂载静态文件目录（/pic -> pic_data）
@@ -159,3 +226,31 @@ CATEGORY_CHOICES: Final[list[str]] = [
     "服装鞋帽", "家居生活", "美妆护肤", "母婴用品",
     "食品饮料", "数码电器", "图书文具", "运动户外", "其他"
 ]
+
+# 微信支付配置
+WECHAT_PAY_MCH_ID = settings.WECHAT_PAY_MCH_ID
+WECHAT_PAY_API_V3_KEY = settings.WECHAT_PAY_API_V3_KEY
+WECHAT_PAY_API_CERT_PATH = settings.WECHAT_PAY_API_CERT_PATH
+WECHAT_PAY_API_KEY_PATH = settings.WECHAT_PAY_API_KEY_PATH
+WECHAT_PAY_PLATFORM_CERT_PATH = settings.WECHAT_PAY_PLATFORM_CERT_PATH
+WECHAT_PAY_PUBLIC_KEY_PATH = settings.WECHAT_PAY_PUBLIC_KEY_PATH
+WECHAT_PAY_NOTIFY_URL = settings.WECHAT_PAY_NOTIFY_URL
+
+# 向后兼容：某些模块仍然使用 `WX_MCHID` 名称
+from typing import Final
+# 向后兼容：某些模块仍然使用 `WX_MCHID` 名称
+from typing import Final
+WX_MCHID: Final[str] = settings.WX_MCHID or WECHAT_PAY_MCH_ID
+
+# 向后兼容：常用的 WX_* 命名，优先读取 WX_* 环境变量，否则回退到 WECHAT_PAY_*
+# 向后兼容：常用的 WX_* 命名，优先读取 WX_* 环境变量，否则回退到 WECHAT_PAY_*
+WX_CERT_SERIAL_NO: Final[str] = settings.WX_CERT_SERIAL_NO or ""
+WX_APIV3_KEY: Final[str] = settings.WX_APIV3_KEY or WECHAT_PAY_API_V3_KEY
+WX_PRIVATE_KEY_PATH: Final[str] = settings.WX_PRIVATE_KEY_PATH or WECHAT_PAY_API_KEY_PATH
+WX_PAY_BASE_URL: Final[str] = settings.WX_PAY_BASE_URL or "https://api.mch.weixin.qq.com"
+# 平台公钥/证书路径（兼容多个环境变量名）
+WECHATPAY_CERT_PATH: Final[str] = settings.WECHATPAY_CERT_PATH or WECHAT_PAY_PLATFORM_CERT_PATH or WECHAT_PAY_PUBLIC_KEY_PATH
+WX_WECHATPAY_SERIAL: Final[str] = settings.WX_WECHATPAY_SERIAL or ""
+
+# 推送配置
+PUSH_TEMPLATE_ID_APPLYMENT = settings.PUSH_TEMPLATE_ID_APPLYMENT        # 新增

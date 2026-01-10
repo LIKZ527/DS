@@ -2,7 +2,7 @@
 动态表访问工具模块
 提供动态获取表结构并构造 SQL 查询的功能
 """
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from decimal import Decimal
 import re
 
@@ -92,6 +92,24 @@ def _quote_identifier(name: str) -> str:
     raise ValueError(f"invalid identifier: {name}")
 
 
+def build_select_list(fields: List[str]) -> str:
+    """构造 SELECT 字段列表。
+
+    对于简单的标识符会使用 `_quote_identifier` 进行引用；对于包含表达式、函数调用、别名或已经引用的字段，保留原样。
+    规则：如果字段字符串包含空格、左括号、反引号或 AS(大小写不限)，则认为是表达式并保留原样；否则按标识符处理。
+    """
+    parts: List[str] = []
+    for f in fields:
+        if not isinstance(f, str):
+            raise ValueError("select fields must be strings")
+        low = f.lower()
+        if " " in f or "(" in f or "`" in f or " as " in low:
+            parts.append(f)
+        else:
+            parts.append(_quote_identifier(f))
+    return ", ".join(parts)
+
+
 def build_select_sql(table_name: str, structure: Dict[str, any], 
                      where_clause: Optional[str] = None,
                      order_by: Optional[str] = None,
@@ -137,7 +155,7 @@ def build_select_sql(table_name: str, structure: Dict[str, any],
             select_parts.append(_quote_identifier(field))
     
     # 引用表名
-    sql = f"SELECT {', '.join(select_parts)} FROM {_quote_identifier(table_name)}"
+    sql = f"SELECT {build_select_list(select_parts)} FROM {_quote_identifier(table_name)}"
     
     if where_clause:
         # where_clause 可能包含参数占位符，仍然允许使用占位符，但禁止分号等附加语句
@@ -196,3 +214,77 @@ def clear_table_cache(table_name: Optional[str] = None):
     else:
         _table_structure_cache.clear()
 
+
+# ===== 新增缺失的函数 =====
+
+def build_dynamic_insert(cursor, table: str, data: Dict[str, Any]) -> str:
+    """
+    构建动态 INSERT SQL 语句
+
+    Args:
+        cursor: 数据库游标
+        table: 表名
+        data: 要插入的数据字典 {字段名: 值}
+
+    Returns:
+        完整的 INSERT SQL 语句
+    """
+    if not data:
+        raise ValueError("插入数据不能为空")
+
+    # 获取表结构验证字段
+    structure = get_table_structure(cursor, table, use_cache=False)
+    valid_fields = structure['fields']
+
+    # 过滤掉不存在的字段（防止SQL错误）
+    filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+
+    if not filtered_data:
+        raise ValueError(f"没有有效字段可插入，有效字段: {valid_fields}")
+
+    columns = list(filtered_data.keys())
+    placeholders = ["%s"] * len(columns)
+
+    columns_str = ", ".join([_quote_identifier(col) for col in columns])
+    placeholders_str = ", ".join(placeholders)
+
+    sql = f"INSERT INTO {_quote_identifier(table)} ({columns_str}) VALUES ({placeholders_str})"
+    return sql
+
+
+def build_dynamic_update(cursor, table: str, data: Dict[str, Any], where_clause: Optional[str] = None) -> str:
+    """
+    构建动态 UPDATE SQL 语句
+
+    Args:
+        cursor: 数据库游标
+        table: 表名
+        data: 要更新的数据字典 {字段名: 新值}
+        where_clause: WHERE条件子句（如 "id = %s"）
+
+    Returns:
+        完整的 UPDATE SQL 语句
+    """
+    if not data:
+        raise ValueError("更新数据不能为空")
+
+    # 获取表结构验证字段
+    structure = get_table_structure(cursor, table, use_cache=False)
+    valid_fields = structure['fields']
+
+    # 过滤掉不存在的字段
+    filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+
+    if not filtered_data:
+        raise ValueError(f"没有有效字段可更新，有效字段: {valid_fields}")
+
+    set_clause = ", ".join([f"{_quote_identifier(key)} = %s" for key in filtered_data.keys()])
+    sql = f"UPDATE {_quote_identifier(table)} SET {set_clause}"
+
+    if where_clause:
+        # 安全检查
+        if ";" in where_clause or "--" in where_clause or "/*" in where_clause:
+            raise ValueError("unsafe characters in where_clause")
+        sql += f" WHERE {where_clause}"
+
+    return sql

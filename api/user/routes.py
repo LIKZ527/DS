@@ -12,14 +12,15 @@ from models.schemas.user import (
 from core.database import get_conn
 from core.logging import get_logger
 from core.table_access import build_dynamic_select, get_table_structure, _quote_identifier
+from core.auth import create_access_token  # ✅ 新增：导入 Token 创建函数
 from services.user_service import UserService, UserStatus, verify_pwd, hash_pwd
 from services.address_service import AddressService
 from services.points_service import add_points
 from services.reward_service import TeamRewardService
 from services.director_service import DirectorService
 from services.wechat_service import WechatService
+from core.table_access import build_select_list
 from typing import List
-
 
 logger = get_logger(__name__)
 
@@ -95,42 +96,67 @@ def set_user_status(body: SetStatusReq):
             conn.commit()
             return {"success": True}
 
+
 @router.post("/user/auth", summary="一键登录（不存在则自动注册）")
 def user_auth(body: AuthReq):
+    """
+    用户认证接口
+    - 支持自动注册
+    - 返回持久化的 JWT/UUID Token
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             select_sql = build_dynamic_select(
                 cur,
                 "users",
                 where_clause="mobile=%s",
-                select_fields=["id", "password_hash", "member_level", "status"]
+                select_fields=["id", "password_hash", "member_level", "status", "name"]
             )
             cur.execute(select_sql, (body.mobile,))
             row = cur.fetchone()
 
+            is_new_user = False
+
             if row:
+                # 已有用户：验证密码
                 if not verify_pwd(body.password, row["password_hash"]):
                     raise HTTPException(status_code=400, detail="手机号或密码错误")
+
                 status = row["status"]
                 if status == UserStatus.FROZEN:
                     raise HTTPException(status_code=403, detail="账号已冻结")
                 if status == UserStatus.DELETED:
                     raise HTTPException(status_code=403, detail="账号已注销")
-                token = str(uuid.uuid4())
-                return AuthResp(uid=row["id"], token=token, level=row["member_level"], is_new=False)
 
-            try:
-                uid = UserService.register(
-                    mobile=body.mobile,
-                    pwd=body.password,
-                    name=body.name,
-                    referrer_mobile=None
-                )
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
+                user_id = row["id"]
+                level = row["member_level"]
+                name = row["name"]
+            else:
+                # 新用户：自动注册
+                try:
+                    user_id = UserService.register(
+                        mobile=body.mobile,
+                        pwd=body.password,
+                        name=body.name,
+                        referrer_mobile=None
+                    )
+                    level = 0
+                    is_new_user = True
+                    name = body.name
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
 
-            token = str(uuid.uuid4())
-            return AuthResp(uid=uid, token=token, level=0, is_new=True)
+            # ✅ 关键修复：创建并持久化 Token（保存到 sessions 表或 users.token 字段）
+            token = create_access_token(user_id, token_type="uuid")
+
+            logger.info(f"用户认证成功 - ID: {user_id}, 手机: {body.mobile}, Token: {token[:8]}...")
+
+            return AuthResp(
+                uid=user_id,
+                token=token,
+                level=level,
+                is_new=is_new_user
+            )
 
 @router.post("/user/update-profile", summary="修改资料（动态字段/兼容老库）")
 def update_profile(body: UpdateProfileReq):
@@ -371,7 +397,7 @@ def upgrade(mobile: str):
             args.append(new_level)
             if "level_changed_at" in cols:
                 set_parts.append(f"{_quote_identifier('level_changed_at')}=NOW()")
-            sql = f"UPDATE users SET {', '.join(set_parts)} WHERE id=%s"
+            sql = f"UPDATE users SET {build_select_list(set_parts)} WHERE id=%s"
             args.append(user_id)          # 最后一个占位符
             cur.execute(sql, tuple(args)) # 参数数量 = 占位符数量
 
@@ -520,17 +546,19 @@ def user_info(mobile: str):
         referrer=referrer
     )
 
-@router.get("/user/list", summary="分页列表+筛选")
+
+@router.get("/user/list", summary="分页用户列表+筛选")
 def user_list(
-    id_start: int = None,
-    id_end: int = None,
-    level_start: int = 0,
-    level_end: int = 6,
-    page: int = 1,
-    size: int = 20,
+        id_start: int = None,
+        id_end: int = None,
+        level_start: int = 0,
+        level_end: int = 6,
+        page: int = 1,
+        size: int = 20,
 ):
     if level_start > level_end or (id_start is not None and id_end is not None and id_start > id_end):
         _err("区间左值不能大于右值")
+
     where, args = [], []
     if id_start is not None:
         where.append("id >= %s")
@@ -540,9 +568,17 @@ def user_list(
         args.append(id_end)
     where.append("member_level BETWEEN %s AND %s")
     args.extend([level_start, level_end])
+
     sql_where = "WHERE " + " AND ".join(where) if where else ""
-    limit_sql = "LIMIT %s OFFSET %s"
-    args.extend([size, (page - 1) * size])
+
+    # ❌ 删除或注释掉以下两行
+    # limit_sql = "LIMIT %s OFFSET %s"
+    # args.extend([size, (page - 1) * size])
+
+    # ✅ 新增：直接生成 MySQL 风格的 limit 字符串
+    offset = (page - 1) * size
+    limit_str = f"{offset}, {size}"
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 使用动态表访问构造查询
@@ -551,81 +587,105 @@ def user_list(
                 "users",
                 where_clause=sql_where.replace("WHERE ", "") if sql_where else None,
                 order_by="id",
-                limit=limit_sql.replace("LIMIT ", "") if limit_sql else None,
+                limit=limit_str,  # ✅ 直接传入确定的字符串
                 select_fields=["id", "mobile", "name", "member_level", "created_at"]
             )
             cur.execute(select_sql, tuple(args))
             rows = cur.fetchall()
+
             # COUNT 查询
             count_sql = f"SELECT COUNT(*) AS c FROM users {sql_where}"
-            cur.execute(count_sql, tuple(args[:-2]))
+            cur.execute(count_sql, tuple(args))  # ✅ 移除 [:-2]
             total = cur.fetchone()["c"]
+
             return {"rows": rows, "total": total, "page": page, "size": size}
 
-@router.post("/user/bind-referrer", summary="绑定推荐人（支持推荐码或手机号）")
+
+@router.post("/user/bind-referrer", summary="绑定推荐人（防重复/防循环/支持推荐码或手机号）")
 def bind_referrer(body: BindReferrerReq):
     """
     优先级：referrer_code > referrer_mobile > 跳过
+    限制：已有推荐人时禁止重复绑定，防止循环推荐关系
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 1. 被推荐人必须存在
-            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
+            # ========== 1. 被推荐人验证 ==========
+            select_sql = build_dynamic_select(cur, "users",
+                                              where_clause="mobile=%s", select_fields=["id", "status"])
             cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
-            if not u:
-                raise HTTPException(status_code=404, detail="被推荐人不存在")
+            if not u or u["status"] == UserStatus.DELETED.value:
+                raise HTTPException(status_code=404, detail="被推荐人不存在或已注销")
             user_id = u["id"]
 
-            # 2. 确定推荐人 ID
+            # ========== 2. 防重复绑定（核心防护） ==========
+            cur.execute("SELECT referrer_id FROM user_referrals WHERE user_id=%s", (user_id,))
+            existing_referrer = cur.fetchone()
+            if existing_referrer:
+                raise HTTPException(
+                    status_code=400,
+                    detail="已有推荐人，不能重复绑定"
+                )
+
+            # ========== 3. 确定推荐人ID ==========
             referrer_id = None
-            if body.referrer_code:                      # ① 优先用推荐码
-                select_sql = build_dynamic_select(cur, "users", where_clause="referral_code=%s", select_fields=["id"])
-                cur.execute(select_sql, (body.referrer_code.upper(),))  # 推荐码统一大写
+            if body.referrer_code:  # 优先用推荐码
+                select_sql = build_dynamic_select(cur, "users",
+                                                  where_clause="referral_code=%s", select_fields=["id", "status"])
+                cur.execute(select_sql, (body.referrer_code.upper(),))
                 ref = cur.fetchone()
-                if not ref:
-                    raise HTTPException(status_code=404, detail="推荐码不存在")
+                if not ref or ref["status"] == UserStatus.DELETED.value:
+                    raise HTTPException(status_code=404, detail="推荐人不存在或已注销")
                 referrer_id = ref["id"]
-            elif body.referrer_mobile:                  # ② 其次用手机号
-                select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
+            elif body.referrer_mobile:  # 其次用手机号
+                select_sql = build_dynamic_select(cur, "users",
+                                                  where_clause="mobile=%s", select_fields=["id", "status"])
                 cur.execute(select_sql, (body.referrer_mobile,))
                 ref = cur.fetchone()
-                if not ref:
-                    raise HTTPException(status_code=404, detail="推荐人手机号不存在")
+                if not ref or ref["status"] == UserStatus.DELETED.value:
+                    raise HTTPException(status_code=404, detail="推荐人不存在或已注销")
                 referrer_id = ref["id"]
+            else:
+                return {"msg": "ok"}  # 无推荐人直接返回
 
-            # 3. 无推荐人直接返回成功（跳过绑定）
-            if referrer_id is None:
-                return {"msg": "ok"}
+            # ========== 4. 防循环推荐（核心防护） ==========
+            if UserService._is_ancestor(referrer_id, user_id):
+                raise HTTPException(
+                    status_code=400,
+                    detail="不能绑定自己的下级，防止形成循环推荐关系"
+                )
 
-            # 4. 自动建表 & 幂等写入（ON DUPLICATE KEY UPDATE）
+            # ========== 5. 写入推荐关系 ==========
+            # 自动建表（兼容老库）
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_referrals (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     user_id INT NOT NULL,
                     referrer_id INT NOT NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE KEY uk_uid (user_id)
+                    UNIQUE KEY uk_uid (user_id),
+                    KEY idx_referrer (referrer_id)
                 )
             """)
+
+            # 写入数据
             cur.execute(
-                "INSERT INTO user_referrals(user_id, referrer_id) VALUES (%s,%s) "
-                "ON DUPLICATE KEY UPDATE referrer_id=%s",
-                (user_id, referrer_id, referrer_id)
+                "INSERT INTO user_referrals(user_id, referrer_id) VALUES (%s,%s)",
+                (user_id, referrer_id)
             )
-            # 同步更新 users 表中的 referral_id 字段（若不存在则自动创建）
-            cur.execute("SHOW COLUMNS FROM users")
-            user_cols2 = [r['Field'] for r in cur.fetchall()]
-            if "referral_id" not in user_cols2:
+
+            # 同步更新 users.referral_id 字段（若不存在则自动创建）
+            cur.execute("SHOW COLUMNS FROM users LIKE 'referral_id'")
+            if not cur.fetchone():
                 cur.execute(
                     "ALTER TABLE users ADD COLUMN referral_id INT DEFAULT NULL COMMENT '推荐人ID'"
                 )
-                conn.commit()  # 提交 DDL
 
-            # 更新 users.referral_id 为绑定的推荐人 id
             cur.execute("UPDATE users SET referral_id=%s WHERE id=%s", (referrer_id, user_id))
             conn.commit()
-            return {"msg": "ok"}
+
+            logger.info(f"推荐绑定成功: 用户ID={user_id}, 推荐人ID={referrer_id}")
+            return {"msg": "绑定成功"}
 
 @router.get("/user/refer-direct", summary="直推列表")
 def refer_direct(mobile: str, page: int = 1, size: int = 10):
@@ -1025,8 +1085,9 @@ def points_log(mobile: str, points_type: str = "member", page: int = 1, size: in
             
             where, args = ["user_id=%s", "type=%s"], [u["id"], points_type]  # 修改为正确的列名 type
             sql_where = " AND ".join(where)
+
             sql = f"""
-                SELECT {', '.join(select_fields)}
+                SELECT {build_select_list(select_fields)}
                 FROM {_quote_identifier('points_log')}
                 WHERE {sql_where}
                 ORDER BY created_at DESC

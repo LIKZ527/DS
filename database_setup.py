@@ -88,12 +88,17 @@ class DatabaseManager:
                     is_merchant TINYINT(1) NOT NULL DEFAULT 0 COMMENT '判断是不是商家',
                     six_director INT NULL DEFAULT 0 COMMENT '直推六星人数，用于荣誉董事晋升判定',
                     six_team INT NULL DEFAULT 0 COMMENT '团队六星人数，用于荣誉董事晋升判定',
+                    wechat_sub_mchid VARCHAR(32) NULL DEFAULT NULL COMMENT '微信特约商户号',
+                    openid VARCHAR(128) NULL DEFAULT NULL COMMENT '微信小程序openid',
+                    token VARCHAR(64) NULL COMMENT 'UUID认证token（仅开发环境）',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_mobile (mobile),
                     INDEX idx_email (email),
                     INDEX idx_member_level (member_level),
-                    UNIQUE KEY uk_referral_code (referral_code)
+                    INDEX idx_wechat_sub_mchid (wechat_sub_mchid),
+                    UNIQUE KEY uk_referral_code (referral_code),
+                    INDEX idx_token (token)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'products': """
@@ -126,6 +131,8 @@ class DatabaseManager:
                     order_number VARCHAR(50) UNIQUE COMMENT '订单号（兼容订单系统）',
                     user_id BIGINT UNSIGNED NOT NULL,
                     merchant_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '商家ID（0=平台自营）',
+                    offline_order_flag TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否线下收银订单：0线上/1线下',
+                    applyment_id BIGINT UNSIGNED DEFAULT NULL COMMENT '关联微信进件单ID（线下订单必填）',
                     total_amount DECIMAL(12,2) NOT NULL,
                     original_amount DECIMAL(12,2) DEFAULT 0.00,
                     points_discount DECIMAL(12,4) NOT NULL DEFAULT 0.0000,
@@ -160,6 +167,7 @@ class DatabaseManager:
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     order_id BIGINT UNSIGNED NOT NULL,
                     product_id BIGINT UNSIGNED NOT NULL,
+                    sku_id BIGINT UNSIGNED NULL,
                     quantity INT NOT NULL DEFAULT 1,
                     unit_price DECIMAL(12,2) NOT NULL,
                     total_price DECIMAL(12,2) NOT NULL,
@@ -173,7 +181,7 @@ class DatabaseManager:
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     account_name VARCHAR(100) NOT NULL,
                     account_type VARCHAR(50) UNIQUE NOT NULL,
-                    balance DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+                    balance DECIMAL(14,4) NOT NULL DEFAULT 0.0000,
                     config_params JSON DEFAULT NULL COMMENT '资金池配置参数',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE KEY uk_account_type (account_type)
@@ -185,8 +193,8 @@ class DatabaseManager:
                     account_id BIGINT UNSIGNED,
                     related_user BIGINT UNSIGNED,
                     account_type VARCHAR(50),
-                    change_amount DECIMAL(14,2) NOT NULL,
-                    balance_after DECIMAL(14,2),
+                    change_amount DECIMAL(14,4) NOT NULL,
+                    balance_after DECIMAL(14,4),
                     flow_type VARCHAR(50),
                     remark VARCHAR(255),
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -240,6 +248,8 @@ class DatabaseManager:
                     coupon_type ENUM('user','merchant') NOT NULL,
                     amount DECIMAL(14,4) NOT NULL,
                     status ENUM('unused','used','expired') NOT NULL DEFAULT 'unused',
+                    applicable_product_type ENUM('all','normal_only','member_only') NOT NULL DEFAULT 'all' COMMENT '优惠券适
+                    用商品范围：all=不限制，normal_only=仅普通商品，member_only=仅会员商品',
                     valid_from DATE NOT NULL,
                     valid_to DATE NOT NULL,
                     used_at DATETIME DEFAULT NULL,
@@ -252,9 +262,9 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS withdrawals (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT UNSIGNED NOT NULL,
-                    amount DECIMAL(14,2) NOT NULL,
-                    tax_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00,
-                    actual_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+                    amount DECIMAL(14,4) NOT NULL,
+                    tax_amount DECIMAL(14,4) NOT NULL DEFAULT 0.00,
+                    actual_amount DECIMAL(14,4) NOT NULL DEFAULT 0.00,
                     status VARCHAR(30) NOT NULL DEFAULT 'pending_auto',
                     audit_remark VARCHAR(255) DEFAULT NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -436,8 +446,8 @@ class DatabaseManager:
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT UNSIGNED NOT NULL COMMENT '用户ID',
                     period_date DATE NOT NULL COMMENT '分红周期日期',
-                    dividend_amount DECIMAL(14,2) NOT NULL COMMENT '分红金额',
-                    new_sales DECIMAL(14,2) NOT NULL DEFAULT 0.00 COMMENT '本期新业绩',
+                    dividend_amount DECIMAL(14,4) NOT NULL COMMENT '分红金额',
+                    new_sales DECIMAL(14,4) NOT NULL DEFAULT 0.00 COMMENT '本期新业绩',
                     weight INT NOT NULL DEFAULT 1 COMMENT '权重，基于团队六星人数',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                     INDEX idx_user_id (user_id),
@@ -451,10 +461,206 @@ class DatabaseManager:
                     bank_name VARCHAR(50) NOT NULL,
                     bank_account VARCHAR(30) NOT NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE KEY uk_user_card (user_id, bank_account),
+                    INDEX idx_user_card (user_id, bank_account),
                     CONSTRAINT fk_user_bankcard FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
+            'wx_applyment': """
+                CREATE TABLE IF NOT EXISTS wx_applyment (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+                    user_id BIGINT UNSIGNED NOT NULL COMMENT '商家用户ID，关联 users.id',
+                    business_code VARCHAR(124) NOT NULL COMMENT '业务申请编号（唯一，服务商自定义）',
+                    applyment_id BIGINT UNSIGNED NULL COMMENT '微信支付申请单号',
+                    sub_mchid VARCHAR(32) NULL COMMENT '特约商户号',
+                    subject_type ENUM(
+                        'SUBJECT_TYPE_INDIVIDUAL',
+                        'SUBJECT_TYPE_ENTERPRISE',
+                        'SUBJECT_TYPE_INSTITUTIONS',
+                        'SUBJECT_TYPE_OTHERS'
+                    ) NOT NULL COMMENT '主体类型',
+                    subject_info JSON NOT NULL COMMENT '主体资料（营业执照、法人信息等）',
+                    contact_info JSON NOT NULL COMMENT '超级管理员信息',
+                    bank_account_info JSON NOT NULL COMMENT '结算账户信息',
+                    applyment_state ENUM(
+                        'APPLYMENT_STATE_EDITTING',
+                        'APPLYMENT_STATE_AUDITING',
+                        'APPLYMENT_STATE_REJECTED',
+                        'APPLYMENT_STATE_TO_BE_CONFIRMED',
+                        'APPLYMENT_STATE_TO_BE_SIGNED',
+                        'APPLYMENT_STATE_SIGNING',
+                        'APPLYMENT_STATE_FINISHED',
+                        'APPLYMENT_STATE_CANCELED'
+                    ) NOT NULL DEFAULT 'APPLYMENT_STATE_EDITTING' COMMENT '申请单状态',
+                    applyment_state_msg VARCHAR(1024) NULL COMMENT '状态描述',
+                    sign_url VARCHAR(512) NULL COMMENT '超管签约链接',
+                    audit_detail JSON NULL COMMENT '驳回详情（字段级错误数组）',
+                    is_draft TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否为草稿：1草稿/0已提交',
+                    draft_expired_at DATETIME NULL COMMENT '草稿过期时间（创建+7天）',
+                    is_core_info_modified TINYINT(1) NOT NULL DEFAULT 0 COMMENT '核心信息修改标记',
+                    submitted_at DATETIME NULL COMMENT '正式提交时间',
+                    finished_at DATETIME NULL COMMENT '完成时间',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uk_business_code (business_code),
+                    INDEX idx_user_id (user_id),
+                    INDEX idx_applyment_id (applyment_id),
+                    INDEX idx_sub_mchid (sub_mchid),
+                    INDEX idx_applyment_state (applyment_state)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            'wx_applyment_log': """
+                CREATE TABLE IF NOT EXISTS wx_applyment_log (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    applyment_id BIGINT UNSIGNED NOT NULL COMMENT '关联微信申请单号',
+                    business_code VARCHAR(124) NOT NULL COMMENT '业务申请编号',
+                    old_state VARCHAR(50) NOT NULL COMMENT '变更前状态',
+                    new_state VARCHAR(50) NOT NULL COMMENT '变更后状态',
+                    state_msg VARCHAR(1024) NULL COMMENT '状态描述',
+                    reject_detail JSON NULL COMMENT '驳回详情',
+                    operator VARCHAR(50) NULL COMMENT '操作来源：SYSTEM/USER/WECHAT',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_applyment_id (applyment_id),
+                    INDEX idx_business_code (business_code),
+                    INDEX idx_created_at (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            'wx_applyment_media': """
+                CREATE TABLE IF NOT EXISTS wx_applyment_media (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    applyment_id BIGINT UNSIGNED NULL COMMENT '关联申请单ID，草稿时可为空',
+                    user_id BIGINT UNSIGNED NOT NULL COMMENT '上传用户ID，关联 users.id',
+                    media_id VARCHAR(512) NULL COMMENT '微信媒体ID（24小时有效）',
+                    media_type ENUM(
+                        'id_card_front',
+                        'id_card_back',
+                        'business_license',
+                        'bank_card',
+                        'authorization_letter',
+                        'store_entrance',
+                        'indoor_pic',
+                        'other'
+                    ) NOT NULL COMMENT '材料类型',
+                    file_path VARCHAR(500) NOT NULL COMMENT '本地存储路径',
+                    file_name VARCHAR(255) NOT NULL COMMENT '原始文件名',
+                    file_size INT NOT NULL COMMENT '文件大小（字节）',
+                    sha256 CHAR(64) NOT NULL COMMENT '文件SHA256哈希',
+                    mime_type VARCHAR(50) NOT NULL COMMENT 'MIME类型',
+                    upload_status ENUM('local','uploaded','expired','rejected')
+                        NOT NULL DEFAULT 'local' COMMENT '上传状态',
+                    expires_at DATETIME NULL COMMENT 'media_id过期时间',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_applyment_id (applyment_id),
+                    INDEX idx_user_id (user_id),
+                    INDEX idx_media_id (media_id),
+                    INDEX idx_media_type (media_type)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            'merchant_settlement_accounts': """
+                CREATE TABLE IF NOT EXISTS merchant_settlement_accounts (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT UNSIGNED NOT NULL COMMENT '商家用户ID，关联 users.id',
+                    sub_mchid VARCHAR(32) NULL COMMENT '特约商户号',
+                    account_type ENUM('BANK_ACCOUNT_TYPE_PERSONAL','BANK_ACCOUNT_TYPE_CORPORATE')
+                        NOT NULL COMMENT '账户类型',
+                    account_bank VARCHAR(128) NOT NULL COMMENT '开户银行',
+                    bank_name VARCHAR(128) NULL COMMENT '开户行全称（含支行）',
+                    bank_branch_id VARCHAR(128) NULL COMMENT '开户行联行号',
+                    bank_address_code VARCHAR(20) NOT NULL COMMENT '开户银行地区码（6位数字码）',
+                    account_name_encrypted TEXT NOT NULL COMMENT '开户名称（加密，RSA+Base64）',
+                    account_number_encrypted TEXT NOT NULL COMMENT '银行账号（加密，RSA+Base64）',
+                    verify_result ENUM('VERIFY_SUCCESS','VERIFY_FAIL','VERIFYING')
+                        NOT NULL DEFAULT 'VERIFYING' COMMENT '验证结果',
+                    verify_fail_reason VARCHAR(1024) NULL COMMENT '验证失败原因',
+                    modify_application_no VARCHAR(64) DEFAULT NULL COMMENT '改绑申请单号',
+                    modify_fail_reason VARCHAR(255) DEFAULT NULL COMMENT '改绑失败原因',
+                            -- ✅ 新增字段：改绑临时存储
+                    new_account_number_encrypted TEXT NULL COMMENT '改绑-新卡号(加密)',
+                    new_account_name_encrypted TEXT NULL COMMENT '改绑-新户名(加密)',
+                    new_bank_name VARCHAR(128) NULL COMMENT '改绑-新开户行',
+                    old_account_backup JSON NULL COMMENT '改绑-旧卡备份{number,name,bank}',
+                    is_default TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否默认账户：1默认',
+                    status TINYINT(1) NOT NULL DEFAULT 1 COMMENT '账户状态：1启用/0禁用',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    bind_at DATETIME NULL COMMENT '绑定成功时间',
+                    INDEX idx_user_id (user_id),
+                    INDEX idx_sub_mchid (sub_mchid),
+                    INDEX idx_verify_result (verify_result),
+                    INDEX idx_status (status)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            'merchant_realname_verification': """
+                CREATE TABLE IF NOT EXISTS merchant_realname_verification (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT UNSIGNED NOT NULL UNIQUE COMMENT '商家用户ID，一个用户一条记录',
+                    verification_type ENUM('individual','enterprise') NOT NULL COMMENT '认证类型',
+                    status ENUM('pending','auditing','approved','rejected')
+                        NOT NULL DEFAULT 'pending' COMMENT '认证状态',
+                    audit_remark TEXT NULL COMMENT '审核备注/驳回原因',
+                    real_name VARCHAR(100) NOT NULL COMMENT '姓名/企业名称',
+                    id_card_no_encrypted TEXT NULL COMMENT '身份证号/统一社会信用代码（加密）',
+                    id_card_front_media_id VARCHAR(512) NULL COMMENT '身份证正面media_id',
+                    id_card_back_media_id VARCHAR(512) NULL COMMENT '身份证反面media_id',
+                    business_license_no VARCHAR(100) NULL COMMENT '营业执照号（企业必填）',
+                    business_license_media_id VARCHAR(512) NULL COMMENT '营业执照media_id',
+                    legal_person_name VARCHAR(100) NULL COMMENT '法人姓名（企业必填）',
+                    legal_person_id_no_encrypted TEXT NULL COMMENT '法人身份证号(加密)',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    audited_at DATETIME NULL COMMENT '审核时间',
+                    INDEX idx_status (status)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            'user_bankcard_operations': """
+                CREATE TABLE IF NOT EXISTS user_bankcard_operations (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT UNSIGNED NOT NULL COMMENT '用户ID',
+                    operation_type VARCHAR(50) NOT NULL COMMENT '操作类型：bind/unbind/set_default/verify',
+                    target_id BIGINT UNSIGNED NULL COMMENT '关联的结算账户ID(merchant_settlement_accounts.id)',
+                    old_val JSON NULL COMMENT '旧值（JSON）',
+                    new_val JSON NULL COMMENT '新值（JSON）',
+                    remark TEXT NULL COMMENT '操作详情',
+                    admin_key VARCHAR(100) NULL COMMENT '管理员标识(SYSTEM表示系统操作)',
+                    ip_address VARCHAR(45) NULL COMMENT 'IP地址',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_user_id (user_id),
+                    INDEX idx_operation_type (operation_type),
+                    INDEX idx_created_at (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            'merchant_stores': """
+            CREATE TABLE IF NOT EXISTS merchant_stores (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT '店铺ID',
+                user_id BIGINT UNSIGNED NOT NULL UNIQUE COMMENT '商家用户ID（唯一）',
+                store_name VARCHAR(100) NOT NULL COMMENT '店铺名称',
+                store_logo_image_id VARCHAR(100) COMMENT '店铺LOGO图片ID',
+                store_description VARCHAR(500) COMMENT '店铺简介',
+                contact_name VARCHAR(20) NOT NULL COMMENT '联系人姓名',
+                contact_phone VARCHAR(11) NOT NULL COMMENT '联系人手机号',
+                contact_email VARCHAR(100) COMMENT '联系人邮箱',
+                business_hours VARCHAR(100) COMMENT '营业时间',
+                store_address VARCHAR(200) COMMENT '店铺地址',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                INDEX idx_user_id (user_id),
+                INDEX idx_store_name (store_name),
+                CONSTRAINT fk_merchant_stores_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+
+            'store_logos': """
+            CREATE TABLE IF NOT EXISTS store_logos (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'LOGO ID',
+                image_id VARCHAR(100) NOT NULL UNIQUE COMMENT '图片ID（唯一）',
+                user_id BIGINT UNSIGNED NOT NULL COMMENT '商家用户ID',
+                file_path VARCHAR(500) NOT NULL COMMENT '文件存储路径',
+                file_size INT NOT NULL COMMENT '文件大小（字节）',
+                upload_time DATETIME NOT NULL COMMENT '上传时间',
+                INDEX idx_user_id (user_id),
+                INDEX idx_image_id (image_id),
+                CONSTRAINT fk_store_logos_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
         }
 
         # 定义必需字段（用于检查和更新已存在的表）
@@ -471,11 +677,18 @@ class DatabaseManager:
                 'subsidy_points': 'subsidy_points DECIMAL(12,4) NOT NULL DEFAULT 0.0000 COMMENT \'周补贴专用点数\'',
                 'team_reward_points': 'team_reward_points DECIMAL(12,4) NOT NULL DEFAULT 0.0000 COMMENT \'团队奖励专用点数\'',
                 'referral_points': 'referral_points DECIMAL(12,4) NOT NULL DEFAULT 0.0000 COMMENT \'推荐奖励专用点数\'',
+                'wechat_sub_mchid': 'wechat_sub_mchid VARCHAR(32) NULL DEFAULT NULL COMMENT \'微信特约商户号\'',
+                'has_store_permission': 'has_store_permission TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'是否开通开店权限（支付进件成功后置为1）\'',
             },
             'orders': {
                 'tracking_number': 'tracking_number VARCHAR(64) NULL COMMENT \'快递单号\'',
                 'delivery_way': 'delivery_way VARCHAR(20) NOT NULL DEFAULT \'platform\' COMMENT \'配送方式：platform-平台配送/pickup-自提\'',
                 'expire_at': 'expire_at DATETIME NULL COMMENT \'订单过期时间（未支付订单7天后自动过期）\'',
+                'offline_order_flag': 'offline_order_flag TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'是否线下收银订单：0线上/1线下\'',
+                'applyment_id': 'applyment_id BIGINT UNSIGNED DEFAULT NULL COMMENT \'关联微信进件单ID（线下订单必填）\'',
+            },
+            'order_items': {
+                'sku_id': 'sku_id BIGINT UNSIGNED NULL',
             },
             'cart': {
                 'specifications': 'specifications JSON DEFAULT NULL',
@@ -484,6 +697,17 @@ class DatabaseManager:
             # 联创星级分红手动调整配置字段
             'finance_accounts': {
                 'config_params': "config_params JSON DEFAULT NULL COMMENT '资金池配置参数（如：fixed_amount_per_weight）'"
+            },
+            'merchant_settlement_accounts': {
+                # ✅ 新增改绑相关字段
+                'new_account_number_encrypted': "new_account_number_encrypted TEXT NULL COMMENT '改绑-新卡号(加密)'",
+                'new_account_name_encrypted': "new_account_name_encrypted TEXT NULL COMMENT '改绑-新户名(加密)'",
+                'new_bank_name': "new_bank_name VARCHAR(128) NULL COMMENT '改绑-新开户行'",
+                'old_account_backup': "old_account_backup JSON NULL COMMENT '改绑-旧卡备份{number,name,bank}'",
+            },
+            'coupons': {
+                # 检查并添加 applicable_product_type 字段
+                'applicable_product_type': "applicable_product_type ENUM('all','normal_only','member_only') NOT NULL DEFAULT 'all' COMMENT '优惠券适用商品范围：all=不限制，normal_only=仅普通商品，member_only=仅会员商品'",
             }
         }
         
@@ -507,6 +731,13 @@ class DatabaseManager:
         self._add_user_unilevel_foreign_keys(cursor)
         self._add_directors_foreign_keys(cursor)
         self._add_director_dividends_foreign_keys(cursor)
+
+        # ========== 微信进件模块外键约束 ==========
+        self._add_wx_applyment_foreign_keys(cursor)
+        self._add_wx_applyment_media_foreign_keys(cursor)
+        self._add_merchant_settlement_accounts_foreign_keys(cursor)
+        self._add_merchant_realname_verification_foreign_keys(cursor)
+        self._add_user_bankcard_operations_foreign_keys(cursor)
 
         self._init_finance_accounts(cursor)
         logger.info("数据库表结构初始化完成")
@@ -840,11 +1071,11 @@ class DatabaseManager:
                 AND TABLE_NAME IN ('director_dividends', 'users')
             """)
             existing_tables = {row['TABLE_NAME'] for row in cursor.fetchall()}
-            
+
             if 'director_dividends' not in existing_tables or 'users' not in existing_tables:
                 logger.debug("⚠️ director_dividends 表或 users 表不存在，跳过外键添加")
                 return
-            
+
             cursor.execute("""
                 SELECT CONSTRAINT_NAME 
                 FROM information_schema.TABLE_CONSTRAINTS 
@@ -853,7 +1084,7 @@ class DatabaseManager:
                 AND CONSTRAINT_TYPE = 'FOREIGN KEY'
             """)
             existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
-            
+
             if 'director_dividends_ibfk_1' not in existing_fks:
                 cursor.execute("""
                     ALTER TABLE director_dividends 
@@ -863,6 +1094,47 @@ class DatabaseManager:
                 logger.debug("director_dividends 表外键约束 director_dividends_ibfk_1 已添加")
         except Exception as e:
             logger.debug(f"⚠️ director_dividends 表外键约束添加失败（已忽略）: {e}")
+
+    def _add_wx_applyment_foreign_keys(self, cursor):
+        """微信进件主表外键"""
+        try:
+            cursor.execute("ALTER TABLE wx_applyment ADD CONSTRAINT fk_wx_applyment_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            logger.debug("✅ wx_applyment 外键已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ wx_applyment 外键添加失败: {e}")
+
+    def _add_wx_applyment_media_foreign_keys(self, cursor):
+        """进件材料表外键"""
+        try:
+            cursor.execute("ALTER TABLE wx_applyment_media ADD CONSTRAINT fk_media_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            logger.debug("✅ wx_applyment_media 外键已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ wx_applyment_media 外键添加失败: {e}")
+
+    def _add_merchant_settlement_accounts_foreign_keys(self, cursor):
+        """结算账户表外键"""
+        try:
+            cursor.execute("ALTER TABLE merchant_settlement_accounts ADD CONSTRAINT fk_merchant_account_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            logger.debug("✅ merchant_settlement_accounts 外键已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ merchant_settlement_accounts 外键添加失败: {e}")
+
+    def _add_merchant_realname_verification_foreign_keys(self, cursor):
+        """实名认证表外键"""
+        try:
+            cursor.execute("ALTER TABLE merchant_realname_verification ADD CONSTRAINT fk_realname_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            logger.debug("✅ merchant_realname_verification 外键已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ merchant_realname_verification 外键添加失败: {e}")
+
+    def _add_user_bankcard_operations_foreign_keys(self, cursor):
+        """银行卡操作日志表外键"""
+        try:
+            cursor.execute("ALTER TABLE user_bankcard_operations ADD CONSTRAINT fk_bankcard_op_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            cursor.execute("ALTER TABLE user_bankcard_operations ADD CONSTRAINT fk_bankcard_op_target FOREIGN KEY (target_id) REFERENCES merchant_settlement_accounts(id) ON DELETE CASCADE")
+            logger.debug("✅ user_bankcard_operations 外键已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ user_bankcard_operations 外键添加失败: {e}")
 
     def _init_finance_accounts(self, cursor):
         accounts = [
@@ -877,6 +1149,7 @@ class DatabaseManager:
             ('公司积分账户', 'company_points'),
             ('公司余额账户', 'company_balance'),
             ('平台收入池（会员商品）', 'platform_revenue_pool'),
+            ('微信进件手续费', 'wx_applyment_fee'),
         ]
 
         # 检查是否已存在账户，如果存在则不删除重新初始化
@@ -1153,3 +1426,31 @@ def _fix_pinyin():
         logger.warning("⚠️ pypinyin 未安装，跳过拼音补全功能")
     except Exception as e:
         logger.error(f"❌ 拼音补全失败: {e}")
+
+
+
+# 在文件末尾添加
+def start_background_tasks():
+    """启动后台任务"""
+    from core.scheduler import scheduler
+    scheduler.start()
+
+# 在 initialize_database 函数后调用
+def initialize_database():
+    """初始化数据库表结构（如果尚未创建）"""
+    print("正在检查数据库表结构...")
+    create_database()
+
+    cfg = get_db_config()
+    conn = pymysql.connect(**cfg, cursorclass=pymysql.cursors.DictCursor)
+    try:
+        with conn.cursor() as cursor:
+            db_manager = DatabaseManager()
+            db_manager.init_all_tables(cursor)
+        conn.commit()
+    finally:
+        conn.close()
+
+    print("数据库表结构初始化完成。")
+    print("启动后台任务...")
+    start_background_tasks()

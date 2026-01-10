@@ -3,7 +3,8 @@ import bcrypt
 from typing import Optional, Dict, Any
 from enum import IntEnum
 from core.database import get_conn
-from core.table_access import build_dynamic_select, _quote_identifier
+from core.table_access import build_dynamic_select, _quote_identifier, build_select_list
+from core.db_adapter import build_in_placeholders
 import string
 import random
 from core.logging import get_logger
@@ -45,19 +46,50 @@ class UserService:
     @staticmethod
     def register(mobile: str, pwd: str, name: Optional[str] = None,
                  referrer_mobile: Optional[str] = None) -> int:
-        """用户注册"""
+        """用户注册（防自绑定/防注销/防无效推荐人）"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 1. 手机号重复检查
+                # ========== 1. 基础验证 ==========
+                # 手机号重复检查
                 select_sql = build_dynamic_select(
                     cur, "users", where_clause="mobile=%s", select_fields=["id"])
                 cur.execute(select_sql, (mobile,))
                 if cur.fetchone():
                     raise ValueError("手机号已注册")
 
+                # ========== 2. 推荐人验证（核心防护） ==========
+                referrer_id = None
+                if referrer_mobile:
+                    # 防护1：不能绑定自己
+                    if referrer_mobile == mobile:
+                        raise ValueError("不能绑定自己为推荐人")
+
+                    # 查询推荐人完整信息（包含状态）
+                    select_sql = build_dynamic_select(
+                        cur, "users", where_clause="mobile=%s",
+                        select_fields=["id", "status", "member_level", "mobile"])
+                    cur.execute(select_sql, (referrer_mobile,))
+                    ref = cur.fetchone()
+
+                    # 防护2：推荐人必须存在
+                    if not ref:
+                        raise ValueError(f"推荐人手机号 {referrer_mobile} 不存在")
+
+                    # 防护3：推荐人不能是注销状态
+                    if ref["status"] == int(UserStatus.DELETED):
+                        raise ValueError(f"推荐人 {ref['mobile']} 已注销，无法绑定")
+
+                    # 防护4：推荐人必须是有效会员（至少1星）
+                    if ref["member_level"] < 1:
+                        raise ValueError(f"推荐人 {ref['mobile']} 星级不足，无法绑定")
+
+                    referrer_id = ref["id"]
+                    logger.info(f"注册绑定推荐人: 推荐人ID={referrer_id}, 被推荐人手机={mobile}")
+
+                # ========== 3. 密码处理 ==========
                 pwd_hash = hash_pwd(pwd)
 
-                # 2. 动态列检查
+                # ========== 4. 动态列检查 ==========
                 cur.execute("SHOW COLUMNS FROM users")
                 cols = [r["Field"] for r in cur.fetchall()]
                 desired = [
@@ -69,20 +101,20 @@ class UserService:
                 if "mobile" not in insert_cols or "password_hash" not in insert_cols:
                     raise RuntimeError("数据库 users 表缺少必要字段，请检查表结构")
 
-                # 3. 生成唯一推荐码
+                # ========== 5. 生成唯一推荐码 ==========
                 code = None
                 if "referral_code" in insert_cols:
                     while True:
                         code = _generate_code()
-                        # ====== 绕过 build_dynamic_select，直接写合法 SQL ======
+                        # 绕过 build_dynamic_select，直接写合法 SQL
                         cur.execute(
                             "SELECT 1 FROM users WHERE referral_code=%s LIMIT 1",
                             (code,)
                         )
-                        if not cur.fetchone():        # 没冲突即可用
+                        if not cur.fetchone():  # 没冲突即可用
                             break
 
-                # 4. 组装插入语句
+                # ========== 6. 组装插入语句 ==========
                 vals = []
                 for col in insert_cols:
                     if col == "mobile":
@@ -107,20 +139,67 @@ class UserService:
                 sql = f"INSERT INTO {_quote_identifier('users')}({cols_sql}) VALUES ({placeholders})"
                 cur.execute(sql, tuple(vals))
                 uid = cur.lastrowid
-                conn.commit()
 
-                # 5. 绑定推荐人
-                if referrer_mobile:
-                    select_sql = build_dynamic_select(
-                        cur, "users", where_clause="mobile=%s", select_fields=["id"])
-                    cur.execute(select_sql, (referrer_mobile,))
-                    ref = cur.fetchone()
-                    if ref:
-                        cur.execute(
-                            "INSERT INTO user_referrals(user_id, referrer_id) VALUES (%s,%s)",
-                            (uid, ref["id"])
+                # ========== 7. 绑定推荐人关系 ==========
+                if referrer_id:
+                    # 创建推荐关系表（如果不存在）
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS user_referrals (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            user_id INT NOT NULL,
+                            referrer_id INT NOT NULL,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            UNIQUE KEY uk_uid (user_id),
+                            KEY idx_referrer (referrer_id)
                         )
+                    """)
+
+                    # 写入推荐关系
+                    cur.execute(
+                        "INSERT INTO user_referrals(user_id, referrer_id) VALUES (%s,%s)",
+                        (uid, referrer_id)
+                    )
+
+                    # 同步更新 users.referral_id 字段（用于快速查询）
+                    cur.execute("SHOW COLUMNS FROM users LIKE 'referral_id'")
+                    if not cur.fetchone():
+                        cur.execute(
+                            "ALTER TABLE users ADD COLUMN referral_id INT DEFAULT NULL COMMENT '推荐人ID'"
+                        )
+                    cur.execute("UPDATE users SET referral_id=%s WHERE id=%s", (referrer_id, uid))
+
+                    logger.info(f"✅ 注册成功并绑定推荐人: 新用户ID={uid}, 推荐人ID={referrer_id}")
+
+                conn.commit()
                 return uid
+
+    @staticmethod
+    def _is_ancestor(potential_ancestor: int, user_id: int) -> bool:
+        """
+        检测 potential_ancestor 是否是 user_id 的祖先（防止循环推荐）
+        原理：向上遍历 user_id 的所有上级，检查是否包含 potential_ancestor
+        限制：最多查10层，防止极端情况下性能问题
+        """
+        if not potential_ancestor or not user_id:
+            return False
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 递归向上查询所有祖先
+                cur.execute("""
+                    WITH RECURSIVE ancestors AS (
+                        SELECT %s as id, 0 as layer
+                        UNION ALL
+                        SELECT r.referrer_id, a.layer + 1
+                        FROM user_referrals r
+                        JOIN ancestors a ON a.id = r.user_id
+                        WHERE a.layer < 10  -- 限制递归深度
+                    )
+                    SELECT 1 FROM ancestors WHERE id = %s LIMIT 1
+                """, (user_id, potential_ancestor))
+
+                return cur.fetchone() is not None
+
 
     # ---------------- 以下代码未做任何改动 ----------------
     @staticmethod
@@ -418,8 +497,8 @@ class UserService:
                     FROM user_referrals r
                     JOIN users u ON r.user_id = u.id
                     WHERE r.referrer_id=%s 
-                      AND u.member_level=6 
-                      AND u.status != %s  -- 过滤注销用户
+                        AND u.member_level=6 
+                        AND u.status != %s  -- 过滤注销用户
                     ORDER BY r.created_at 
                     LIMIT 8  -- 允许最多8条，后面会筛选
                 """, (uid, UserStatus.DELETED.value))
@@ -432,7 +511,7 @@ class UserService:
 
                 # 取前7条（如果有8条，弃用第8条）
                 lines = lines[:7]
-                
+
                 # C条件：统计有效线数（过滤注销）
                 valid_lines = UserService._count_valid_lines(cur, lines)
 
@@ -452,7 +531,7 @@ class UserService:
                         FROM team_line tl
                         JOIN users u ON u.id = tl.id
                         WHERE u.member_level = 6 
-                          AND u.status != %s  -- 过滤注销
+                            AND u.status != %s  -- 过滤注销
                     """, (line_id, UserStatus.DELETED.value))
                     count = cur.fetchone()['line_6stars'] or 0
                     lines_6star_counts.append(count)
@@ -471,7 +550,7 @@ class UserService:
                     FROM team t
                     JOIN users u ON u.id = t.id
                     WHERE u.member_level = 6 
-                      AND u.status != %s  -- 过滤注销
+                        AND u.status != %s  -- 过滤注销
                 """, (uid, UserStatus.DELETED.value))
                 total_6star_count = cur.fetchone()['total_6stars'] or 0
 
@@ -499,7 +578,8 @@ class UserService:
         if not line_ids:
             return 0
 
-        union_parts = " UNION ALL ".join([f"SELECT {uid} as user_id" for uid in line_ids])
+        union_parts = " UNION ALL ".join(["SELECT %s as user_id"] * len(line_ids))
+        params_tuple = tuple(line_ids)
 
         cur.execute(f"""
             WITH RECURSIVE all_teams AS (
@@ -519,25 +599,24 @@ class UserService:
                         FROM all_teams at2
                         JOIN users u ON u.id = at2.id
                         WHERE at2.root_id = at.root_id
-                          AND u.member_level = 6
-                          AND u.status != 2  -- ✅ 过滤注销
-                          AND (
-                              SELECT COUNT(DISTINCT r2.user_id)
-                              FROM user_referrals r2
-                              JOIN users u2 ON u2.id = r2.user_id
-                              WHERE r2.referrer_id = at2.id
+                            AND u.member_level = 6
+                            AND u.status != 2  -- ✅ 过滤注销
+                            AND (
+                                SELECT COUNT(DISTINCT r2.user_id)
+                                FROM user_referrals r2
+                                JOIN users u2 ON u2.id = r2.user_id
+                                WHERE r2.referrer_id = at2.id
                                 AND u2.member_level = 6
                                 AND u2.status != 2  -- ✅ 过滤注销
-                          ) >= 3
+                            ) >= 3
                     ) as has_valid_6star
                 FROM (SELECT DISTINCT root_id FROM all_teams) at
             )
             SELECT COUNT(*) as valid_count
             FROM line_stats
             WHERE has_valid_6star = TRUE
-        """)
+        """, params_tuple)
         return cur.fetchone()['valid_count'] or 0
-
 
     @staticmethod
     def promote_unilevel_auto(user_id: int) -> int:
@@ -917,7 +996,7 @@ class UserService:
 
                 # 执行查询
                 sql = f"""
-                    SELECT {', '.join(select_fields)}
+                    SELECT {build_select_list(select_fields)}
                     FROM users
                     WHERE id = %s
                 """
