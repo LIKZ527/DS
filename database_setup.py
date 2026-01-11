@@ -162,6 +162,28 @@ class DatabaseManager:
                     INDEX idx_expire_at (expire_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
+            'offline_order': """
+                CREATE TABLE IF NOT EXISTS offline_order (
+                    id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    order_no            VARCHAR(50) UNIQUE NOT NULL COMMENT '线下订单号',
+                    merchant_id         BIGINT UNSIGNED NOT NULL COMMENT '商家ID',
+                    user_id             BIGINT UNSIGNED NULL COMMENT '付款用户ID（可空）',
+                    store_name          VARCHAR(100) NOT NULL COMMENT '门店名称',
+                    amount              INT NOT NULL COMMENT '订单金额（单位：分）',
+                    product_name        VARCHAR(255) DEFAULT '' COMMENT '商品名称',
+                    remark              TEXT COMMENT '备注',
+                    status              TINYINT NOT NULL DEFAULT 1 COMMENT '1待支付 2已支付 4已退款',
+                    qrcode_url          VARCHAR(500) DEFAULT NULL COMMENT '收款码',
+                    qrcode_expire       DATETIME DEFAULT NULL COMMENT '码过期时间',
+                    refresh_count       TINYINT NOT NULL DEFAULT 0 COMMENT '已刷新次数',
+                    related_order_no    VARCHAR(50) DEFAULT NULL COMMENT '关联主订单号',
+                    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_merchant  (merchant_id),
+                    INDEX idx_status    (status),
+                    INDEX idx_expire    (qrcode_expire)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
             'order_items': """
                 CREATE TABLE IF NOT EXISTS order_items (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -568,6 +590,7 @@ class DatabaseManager:
                     bank_address_code VARCHAR(20) NOT NULL COMMENT '开户银行地区码（6位数字码）',
                     account_name_encrypted TEXT NOT NULL COMMENT '开户名称（加密，RSA+Base64）',
                     account_number_encrypted TEXT NOT NULL COMMENT '银行账号（加密，RSA+Base64）',
+                    card_hash VARCHAR(64) NULL COMMENT '卡号哈希（用于判重，加盐SHA256）',
                     verify_result ENUM('VERIFY_SUCCESS','VERIFY_FAIL','VERIFYING')
                         NOT NULL DEFAULT 'VERIFYING' COMMENT '验证结果',
                     verify_fail_reason VARCHAR(1024) NULL COMMENT '验证失败原因',
@@ -738,6 +761,19 @@ class DatabaseManager:
         self._add_merchant_settlement_accounts_foreign_keys(cursor)
         self._add_merchant_realname_verification_foreign_keys(cursor)
         self._add_user_bankcard_operations_foreign_keys(cursor)
+
+        try:
+            cursor.execute("""
+                CREATE UNIQUE INDEX uk_card_hash_active 
+                ON merchant_settlement_accounts (card_hash) 
+                WHERE status = 1
+            """)
+            logger.info("✅ 已创建条件唯一索引 uk_card_hash_active（防重复绑卡）")
+        except pymysql.MySQLError as e:
+            if e.args[0] == 1061:  # Duplicate key name 错误
+                logger.debug("ℹ️ 条件唯一索引 uk_card_hash_active 已存在，跳过创建")
+            else:
+                logger.warning(f"⚠️ 创建条件唯一索引失败: {e}")
 
         self._init_finance_accounts(cursor)
         logger.info("数据库表结构初始化完成")
