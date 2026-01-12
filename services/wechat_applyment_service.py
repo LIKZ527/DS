@@ -548,6 +548,118 @@ class WechatApplymentService:
         # 关键修复：提供插入参数
         cur.execute(insert_sql, tuple(log_data.values()))
 
+    # services/wechat_applyment_service.py
+    # 在类 WechatApplymentService 中新增辅助方法
+
+    def _generate_card_hash(self, account_number: str, salt: str = "wx_applyment") -> str:
+        """生成银行卡哈希（加盐SHA256）"""
+        import hashlib
+        return hashlib.sha256(f"{account_number}{salt}".encode()).hexdigest()
+
+    def _sync_settlement_account(self, cur, applyment_id: int, user_id: int, sub_mchid: str):
+        """同步进件成功的结算账户信息到 merchant_settlement_accounts 表"""
+        try:
+            # 获取进件资料
+            cur.execute("""
+                SELECT bank_account_info, subject_type 
+                FROM wx_applyment 
+                WHERE applyment_id = %s AND user_id = %s
+            """, (applyment_id, user_id))
+            result = cur.fetchone()
+
+            if not result:
+                logger.warning(f"未找到进件资料: applyment_id={applyment_id}")
+                return
+
+            bank_info = json.loads(result['bank_account_info']) if isinstance(result['bank_account_info'], str) else \
+                result['bank_account_info']
+            subject_type = result['subject_type']
+
+            # 获取账户名称和账号（可能已加密）
+            account_name = bank_info.get('account_name', '')
+            account_number = bank_info.get('account_number', '')
+
+            # 关键修复：正确判断是否加密（微信数据通常不会包含ENCRYPTED字样）
+            # 尝试解密，如果失败则认为是明文
+            try:
+                # 如果数据长度较长且包含base64特征字符，则认为是加密的
+                if len(account_name) > 50 and any(c in account_name for c in '+/='):
+                    account_name_plain = self.pay_client._decrypt_local_encrypted(account_name)
+                else:
+                    account_name_plain = account_name
+
+                if len(account_number) > 50 and any(c in account_number for c in '+/='):
+                    account_number_plain = self.pay_client._decrypt_local_encrypted(account_number)
+                else:
+                    account_number_plain = account_number
+            except Exception as e:
+                logger.warning(f"解密结算账户信息失败（可能已是明文）: {e}")
+                account_name_plain = account_name
+                account_number_plain = account_number
+
+            # 关键修复：重新加密（必须使用微信支付公钥加密）
+            account_name_encrypted = self.pay_client._rsa_encrypt_with_wechat_public_key(account_name_plain)
+            account_number_encrypted = self.pay_client._rsa_encrypt_with_wechat_public_key(account_number_plain)
+
+            # 生成卡号哈希（用于判重）
+            card_hash = self._generate_card_hash(account_number_plain)
+
+            # 判断账户类型
+            account_type_map = {
+                'SUBJECT_TYPE_INDIVIDUAL': 'BANK_ACCOUNT_TYPE_PERSONAL',
+                'SUBJECT_TYPE_ENTERPRISE': 'BANK_ACCOUNT_TYPE_CORPORATE',
+                'SUBJECT_TYPE_INSTITUTIONS': 'BANK_ACCOUNT_TYPE_CORPORATE',
+                'SUBJECT_TYPE_OTHERS': 'BANK_ACCOUNT_TYPE_CORPORATE'
+            }
+            account_type = account_type_map.get(subject_type, 'BANK_ACCOUNT_TYPE_CORPORATE')
+
+            # 构建插入数据（使用原生SQL避免参数问题）
+            insert_sql = """
+                INSERT INTO merchant_settlement_accounts (
+                    user_id, sub_mchid, account_type, account_bank, 
+                    bank_name, bank_branch_id, bank_address_code,
+                    account_name_encrypted, account_number_encrypted, card_hash,
+                    verify_result, status, is_default, bind_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1, 1, NOW()
+                )
+                ON DUPLICATE KEY UPDATE
+                    sub_mchid = VALUES(sub_mchid),
+                    account_type = VALUES(account_type),
+                    account_bank = VALUES(account_bank),
+                    bank_name = VALUES(bank_name),
+                    bank_branch_id = VALUES(bank_branch_id),
+                    bank_address_code = VALUES(bank_address_code),
+                    account_name_encrypted = VALUES(account_name_encrypted),
+                    account_number_encrypted = VALUES(account_number_encrypted),
+                    card_hash = VALUES(card_hash),
+                    verify_result = VALUES(verify_result),
+                    status = VALUES(status),
+                    bind_at = VALUES(bind_at)
+            """
+
+            # 执行插入/更新
+            cur.execute(insert_sql, (
+                user_id,
+                sub_mchid,
+                account_type,
+                bank_info.get('account_bank', ''),
+                bank_info.get('bank_name', ''),
+                bank_info.get('bank_branch_id', ''),
+                bank_info.get('bank_address_code', ''),
+                account_name_encrypted,
+                account_number_encrypted,
+                card_hash,
+                'VERIFY_SUCCESS'  # 进件成功默认验证通过
+            ))
+
+            logger.info(f"同步结算账户成功: user_id={user_id}, sub_mchid={sub_mchid}")
+
+        except Exception as e:
+            logger.error(f"同步结算账户失败: {e}", exc_info=True)
+            # 不抛出异常，避免影响主流程
+
+    # 修改原有的 handle_applyment_state_change 方法
     async def handle_applyment_state_change(self, applyment_id: int, new_state: str, status_info: Dict[str, Any]):
         """处理进件状态变更（带推送）"""
         with get_conn() as conn:
@@ -581,20 +693,27 @@ class WechatApplymentService:
                 )
                 cur.execute(update_sql, (applyment_id,))
 
-                # 如果审核通过，绑定商户号
+                # 如果审核通过，绑定商户号并同步结算账户
                 if new_state == "APPLYMENT_STATE_FINISHED":
+                    sub_mchid = status_info.get("sub_mchid")
+
+                    # 1. 更新users表
                     cur.execute("""
                         UPDATE users u
                         JOIN wx_applyment wa ON u.id = wa.user_id
                         SET u.wechat_sub_mchid = %s
                         WHERE wa.applyment_id = %s
-                    """, (status_info.get("sub_mchid"), applyment_id))
+                    """, (sub_mchid, applyment_id))
+
+                    # 2. 同步结算账户信息
+                    self._sync_settlement_account(cur, applyment_id, user_id, sub_mchid)
+
+                    # 关键修复：在推送前提交数据库事务
+                    conn.commit()
 
                 # 记录日志
                 self._log_state_change(cur, applyment_id, result['business_code'],
                                        old_state, new_state, "WECHAT", status_info.get("state_msg", ""))
-
-                conn.commit()
 
                 # 推送通知
                 await push_service.send_applyment_status_notification(

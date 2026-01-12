@@ -102,16 +102,27 @@ class TaskScheduler:
                                     row['applyment_id']
                                 ))
 
-                                # 如果审核通过，绑定商户号
+                                # 如果审核通过，绑定商户号并同步结算账户
                                 if new_state == "APPLYMENT_STATE_FINISHED":
+                                    sub_mchid = status_info.get("sub_mchid")
+
+                                    # 1. 绑定商户号
                                     cur.execute("""
                                         UPDATE users u
                                         JOIN wx_applyment wa ON u.id = wa.user_id
                                         SET u.wechat_sub_mchid = %s
                                         WHERE wa.applyment_id = %s
-                                    """, (status_info.get("sub_mchid"), row['applyment_id']))
+                                    """, (sub_mchid, row['applyment_id']))
 
-                                conn.commit()
+                                    # 2. 同步结算账户信息（复用service中的方法）
+                                    from services.wechat_applyment_service import WechatApplymentService
+                                    # 在循环外实例化服务类，避免重复创建
+                                    service = WechatApplymentService()
+                                    service._sync_settlement_account(cur, row['applyment_id'], row['user_id'],
+                                                                     sub_mchid)
+
+                                    # 关键修复：在推送前提交数据库事务
+                                    conn.commit()
 
                                 # 推送通知（使用同步方法）
                                 from core.push_service import push_service
