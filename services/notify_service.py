@@ -4,13 +4,14 @@ from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
 from core.config import settings
-from wechatpayv3 import WeChatPay, WeChatPayType
 from core.logging import get_logger
+from core.database import get_conn
 
 logger = get_logger(__name__)
 
 # ----------- 仅在非 Mock 模式才读证书并初始化 wxpay ----------
 if not settings.WX_MOCK_MODE:
+    from wechatpayv3 import WeChatPay, WeChatPayType  # ✅ 导入移到内部
     _private_key = Path(settings.WECHAT_PAY_API_KEY_PATH).read_text(encoding="utf-8")
     wxpay = WeChatPay(
         wechatpay_type=WeChatPayType.MINIPROG,

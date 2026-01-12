@@ -340,6 +340,32 @@ class WeChatPayClient:
         )
         return base64.b64encode(ciphertext).decode('utf-8')
 
+    # ✅ 新增：公共加密方法（供外部服务调用）
+    def encrypt_sensitive_data(self, plaintext: str) -> str:
+        """
+        公共方法：加密敏感数据（用于外部服务调用）
+        实际调用内部的 RSA 加密方法
+
+        Args:
+            plaintext: 待加密的明文（如银行卡号、户名）
+
+        Returns:
+            加密后的字符串（Base64 编码）
+        """
+        try:
+            return self._rsa_encrypt_with_wechat_public_key(plaintext)
+        except Exception as e:
+            logger.error(f"敏感数据加密失败: {str(e)}")
+            if self.mock_mode:
+                # Mock 模式下直接返回模拟加密串
+                timestamp = int(time.time())
+                random_code = hashlib.md5(f"{plaintext}{timestamp}".encode()).hexdigest()[:6]
+                mock_enc = f"MOCK_ENC_{timestamp}_{plaintext}_{random_code}"
+                return base64.b64encode(mock_enc.encode()).decode()
+            raise
+
+    # ==================== 进件相关API（保持不变） ====================
+
     def _sign(self, method: str, url: str, timestamp: str, nonce_str: str, body: str = '') -> str:
         """RSA-SHA256签名"""
         if self.mock_mode:

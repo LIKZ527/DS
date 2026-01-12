@@ -1217,7 +1217,7 @@ def is_merchant(mobile: str):
     return {"is_merchant": UserService.is_merchant(mobile)}
 
 
-@router.post("/user/wechat-login", summary="微信小程序登录")
+@router.post("/user/wechat-login", summary="微信小程序登录", response_model=AuthResp)  # ✅ 修改：添加 response_model=AuthResp
 async def wechat_login(request: Request):
     """微信小程序登录接口"""
     # 确保 users 表存在 openid 字段（兼容旧库）
@@ -1243,19 +1243,32 @@ async def wechat_login(request: Request):
 
         # 检查用户是否已注册
         user = WechatService.check_user_by_openid(openid)
+        is_new_user = False  # ✅ 新增：标记是否为新用户
+
         if not user:
             # 注册新用户
             user_id = WechatService.register_user(openid, nick_name)
+            level = 0  # ✅ 新增：新用户默认等级
+            is_new_user = True  # ✅ 新增：标记为新用户
         else:
             user_id = user['id']
+            # ✅ 新增：从用户记录中获取等级（兼容旧数据）
+            level = user.get('member_level', 0)
+            is_new_user = False
 
-        # 生成token并返回
-        token = WechatService.generate_token(user_id)
-        return {
-            "success": True,
-            "user_id": user_id,
-            "token": token
-        }
+        # ✅ 修改：使用 create_access_token 替代 WechatService.generate_token，与 /user/auth 保持一致
+        token = create_access_token(user_id, token_type="uuid")
+
+        logger.info(f"微信登录成功 - 用户ID: {user_id}, Token: {token[:8]}...")
+
+        # ✅ 修改：返回 AuthResp 对象，与 /user/auth 格式一致
+        return AuthResp(
+            uid=user_id,
+            token=token,
+            level=level,
+            is_new=is_new_user
+        )
+
     except HTTPException:
         raise
     except Exception as e:
