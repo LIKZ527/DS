@@ -224,15 +224,15 @@ class ImageUpdateRequest(BaseModel):
 
 # ---------------- 中文路由摘要 + 修复上下文 ----------------
 
-@router.get("/products/search", summary="🔍 商品模糊搜索")
+@router.get("/products/search", summary="🔍 商品模糊搜索（SKU精确匹配）")
 def search_products(
         keyword: str = Query(..., min_length=1,
-                             description="搜索关键词（名称/描述/SKU/拼音/分类/商家）。同时搜索多个关键词时，请在关键词与关键词之间添加空格")
+                             description="搜索关键词（名称/描述/拼音/分类/商家模糊搜索，SKU编码精确匹配）。多个关键词用空格分隔")
 ):
     """
     1. 按空格拆词，所有词必须同时命中（AND）
-    2. 每个词再拆单字（OR）保证召回
-    3. 不强制包含特定字，完全按关键词关联度返回
+    2. SKU编码改为精确匹配（=），其他字段保持模糊搜索（LIKE）
+    3. 每个词再拆单字（OR）保证召回
     4. 全品类返回，不影响原有环境
     """
     kw = keyword.strip()
@@ -253,7 +253,8 @@ def search_products(
             for word in words:
                 word_pattern = f"%{word}%"
                 word_conditions = []
-                # 搜索多个字段
+
+                # 商品信息模糊搜索
                 word_conditions.append("p.name LIKE %s")
                 params.append(word_pattern)
                 word_conditions.append("p.description LIKE %s")
@@ -262,14 +263,16 @@ def search_products(
                 params.append(word_pattern)
                 word_conditions.append("p.category LIKE %s")
                 params.append(word_pattern)
-                word_conditions.append("ps.sku_code LIKE %s")
-                params.append(word_pattern)
-                # ✅ 修改：搜索商家名称（仅搜索 is_merchant=1 的商家用户）
+
+                # ✅ 修改：SKU编码改为精确搜索（不再是 LIKE %s）
+                word_conditions.append("ps.sku_code = %s")
+                params.append(word)  # 使用原始词，不带通配符
+
+                # 商家名称模糊搜索（仅商家用户）
                 word_conditions.append("(u.name LIKE %s AND u.is_merchant = 1)")
                 params.append(word_pattern)
 
                 # 每个词至少匹配一个字段
-                # 使用安全的 OR 拼接，避免将字段名/表达式交由 build_select_list 处理
                 conditions.append("(" + _safe_concat_or(word_conditions) + ")")
 
             # 所有词必须同时命中
@@ -278,9 +281,7 @@ def search_products(
             # 验证占位符数量与参数数量一致（防止不安全拼接）
             _validate_placeholder_count(where_clause, params)
 
-            # 构建排序：同时命中全部词的置顶（通过计算匹配的字段数）
-            # 简化版：按商品ID排序，实际可以优化为按匹配度排序
-            # ✅ 修改：移除 product_attributes 表的 JOIN（不再搜索属性值）
+            # 构建查询SQL
             sql = f"""
                 SELECT DISTINCT p.*, u.name as merchant_name
                 FROM products p
@@ -304,12 +305,10 @@ def search_products(
                     cur,
                     "product_skus",
                     where_clause="product_id = %s",
-                    # ✅ 修改：查询新增字段 original_price 和 specifications
                     select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (product_id,))
                 skus = cur.fetchall()
-                # ✅ 修改：格式化新增字段
                 skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
                          "original_price": float(s['original_price']) if s['original_price'] else None,
                          "stock": s['stock'], "specifications": s['specifications']} for s in skus]
@@ -782,8 +781,10 @@ def update_product(id: int, payload: ProductUpdate):
 @router.post("/products/{id}/images", summary="📸 上传商品图片")
 def upload_images(
         id: int,
-        detail_images: List[UploadFile] = File([], description="详情图，最多10张，单张<3MB，仅JPG/PNG/WEBP"),
-        banner_images: List[UploadFile] = File([], description="轮播图，最多10张，单张<5MB，仅JPG/PNG/WEBP"),
+        # ✅ 修改：将详情图大小限制从<3MB改为<10MB
+        detail_images: List[UploadFile] = File([], description="详情图，最多10张，单张<10MB，仅JPG/PNG/WEBP"),
+        # ✅ 修改：将轮播图大小限制从<5MB改为<10MB
+        banner_images: List[UploadFile] = File([], description="轮播图，最多10张，单张<10MB，仅JPG/PNG/WEBP"),
 ):
     from PIL import Image
     import uuid
@@ -842,8 +843,9 @@ def upload_images(
                         ext = Path(f.filename).suffix.lower()
                         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
                             raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
-                        if f.size > 3 * 1024 * 1024:
-                            raise HTTPException(status_code=400, detail="详情图单张大小不能超过 3MB")
+                        # ✅ 修改：将详情图大小限制从3MB改为10MB
+                        if f.size > 10 * 1024 * 1024:
+                            raise HTTPException(status_code=400, detail="详情图单张大小不能超过 10MB")
                         file_name = f"detail_{uuid.uuid4().hex}{ext}"
                         file_path = goods_path / file_name
                         with Image.open(f.file) as im:
@@ -866,8 +868,9 @@ def upload_images(
                         ext = Path(f.filename).suffix.lower()
                         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
                             raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
-                        if f.size > 5 * 1024 * 1024:
-                            raise HTTPException(status_code=400, detail="轮播图单张大小不能超过 5MB")
+                        # ✅ 修改：将轮播图大小限制从5MB改为10MB
+                        if f.size > 10 * 1024 * 1024:
+                            raise HTTPException(status_code=400, detail="轮播图单张大小不能超过 10MB")
                         file_name = f"banner_{uuid.uuid4().hex}{ext}"
                         file_path = goods_path / file_name
                         with Image.open(f.file) as im:
@@ -1137,7 +1140,8 @@ def delete_images(
 def update_images(
         id: int,
         image_type: str = Query(..., pattern="^(banner|detail)$", description="图片类型: banner=轮播图, detail=详情图"),
-        files: List[UploadFile] = File(..., description="图片文件列表，最多10张"),
+        # ✅ 修改：更新接口的文件描述也统一改为<10MB
+        files: List[UploadFile] = File(..., description="图片文件列表，最多10张，单张<10MB"),
 ):
     """
     更新商品图片（追加式）
@@ -1194,8 +1198,9 @@ def update_images(
                         ext = Path(f.filename).suffix.lower()
                         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
                             raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
-                        if f.size > 3 * 1024 * 1024:
-                            raise HTTPException(status_code=400, detail="详情图单张大小不能超过 3MB")
+                        # ✅ 修改：将详情图大小限制从3MB改为10MB
+                        if f.size > 10 * 1024 * 1024:
+                            raise HTTPException(status_code=400, detail="详情图单张大小不能超过 10MB")
 
                         # 保存文件
                         file_name = f"detail_{uuid.uuid4().hex}{ext}"
@@ -1232,8 +1237,9 @@ def update_images(
                         ext = Path(f.filename).suffix.lower()
                         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
                             raise HTTPException(status_code=400, detail="仅支持 JPG/PNG/WEBP")
-                        if f.size > 5 * 1024 * 1024:
-                            raise HTTPException(status_code=400, detail="轮播图单张大小不能超过 5MB")
+                        # ✅ 修改：将轮播图大小限制从5MB改为10MB
+                        if f.size > 10 * 1024 * 1024:
+                            raise HTTPException(status_code=400, detail="轮播图单张大小不能超过 10MB")
 
                         # 保存文件
                         file_name = f"banner_{uuid.uuid4().hex}{ext}"
