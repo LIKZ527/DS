@@ -3,15 +3,17 @@ import uuid
 import pymysql
 import jwt
 import datetime
+import requests
 from typing import Optional, Dict, Any
 from fastapi import HTTPException
 
+from core.logging import get_logger
 from core.database import get_conn
 from core.config import WECHAT_APP_ID, WECHAT_APP_SECRET
 from core.table_access import build_dynamic_select, _quote_identifier
 from services.user_service import hash_pwd, UserStatus, _generate_code
 
-
+logger = get_logger(__name__)
 
 class WechatService:
     """微信登录服务"""
