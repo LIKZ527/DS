@@ -41,7 +41,8 @@ def _validate_placeholder_count(sql_fragment: Optional[str], params: List[Any]):
         return
     placeholder_count = sql_fragment.count("%s")
     if placeholder_count != len(params):
-        raise HTTPException(status_code=400, detail=f"SQL 占位符数量({placeholder_count})与参数数量({len(params)})不匹配")
+        raise HTTPException(status_code=400,
+                            detail=f"SQL 占位符数量({placeholder_count})与参数数量({len(params)})不匹配")
 
 
 def _safe_concat_or(conds: List[str]) -> str:
@@ -224,15 +225,15 @@ class ImageUpdateRequest(BaseModel):
 
 # ---------------- 中文路由摘要 + 修复上下文 ----------------
 
-@router.get("/products/search", summary="🔍 商品模糊搜索")
+@router.get("/products/search", summary="🔍 商品模糊搜索（SKU精确匹配）")
 def search_products(
         keyword: str = Query(..., min_length=1,
-                             description="搜索关键词（名称/描述/SKU/拼音/分类/商家）。同时搜索多个关键词时，请在关键词与关键词之间添加空格")
+                             description="搜索关键词（名称/描述/拼音/分类/商家模糊搜索，SKU编码精确匹配）。多个关键词用空格分隔")
 ):
     """
     1. 按空格拆词，所有词必须同时命中（AND）
-    2. 每个词再拆单字（OR）保证召回
-    3. 不强制包含特定字，完全按关键词关联度返回
+    2. SKU编码改为精确匹配（=），其他字段保持模糊搜索（LIKE）
+    3. 每个词再拆单字（OR）保证召回
     4. 全品类返回，不影响原有环境
     """
     kw = keyword.strip()
@@ -253,7 +254,8 @@ def search_products(
             for word in words:
                 word_pattern = f"%{word}%"
                 word_conditions = []
-                # 搜索多个字段
+
+                # 商品信息模糊搜索
                 word_conditions.append("p.name LIKE %s")
                 params.append(word_pattern)
                 word_conditions.append("p.description LIKE %s")
@@ -262,14 +264,16 @@ def search_products(
                 params.append(word_pattern)
                 word_conditions.append("p.category LIKE %s")
                 params.append(word_pattern)
-                word_conditions.append("ps.sku_code LIKE %s")
-                params.append(word_pattern)
-                # ✅ 修改：搜索商家名称（仅搜索 is_merchant=1 的商家用户）
+
+                # ✅ 修改：SKU编码改为精确搜索（不再是 LIKE %s）
+                word_conditions.append("ps.sku_code = %s")
+                params.append(word)  # 使用原始词，不带通配符
+
+                # 商家名称模糊搜索（仅商家用户）
                 word_conditions.append("(u.name LIKE %s AND u.is_merchant = 1)")
                 params.append(word_pattern)
 
                 # 每个词至少匹配一个字段
-                # 使用安全的 OR 拼接，避免将字段名/表达式交由 build_select_list 处理
                 conditions.append("(" + _safe_concat_or(word_conditions) + ")")
 
             # 所有词必须同时命中
@@ -278,9 +282,7 @@ def search_products(
             # 验证占位符数量与参数数量一致（防止不安全拼接）
             _validate_placeholder_count(where_clause, params)
 
-            # 构建排序：同时命中全部词的置顶（通过计算匹配的字段数）
-            # 简化版：按商品ID排序，实际可以优化为按匹配度排序
-            # ✅ 修改：移除 product_attributes 表的 JOIN（不再搜索属性值）
+            # 构建查询SQL
             sql = f"""
                 SELECT DISTINCT p.*, u.name as merchant_name
                 FROM products p
@@ -304,12 +306,10 @@ def search_products(
                     cur,
                     "product_skus",
                     where_clause="product_id = %s",
-                    # ✅ 修改：查询新增字段 original_price 和 specifications
                     select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (product_id,))
                 skus = cur.fetchall()
-                # ✅ 修改：格式化新增字段
                 skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
                          "original_price": float(s['original_price']) if s['original_price'] else None,
                          "stock": s['stock'], "specifications": s['specifications']} for s in skus]
@@ -779,6 +779,81 @@ def update_product(id: int, payload: ProductUpdate):
                 raise HTTPException(status_code=400, detail=f"更新商品失败: {str(e)}")
 
 
+@router.delete("/products/{id}", summary="🗑️ 删除商品")
+def delete_product(id: int):
+    """
+    删除指定商品及其所有关联数据（SKU、属性、轮播图、订单项等）
+    注意：此操作会级联删除所有相关数据，且不可撤销！
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                # 检查商品是否存在
+                select_sql = build_dynamic_select(
+                    cur,
+                    "products",
+                    where_clause="id = %s"
+                )
+                cur.execute(select_sql, (id,))
+                product = cur.fetchone()
+                if not product:
+                    raise HTTPException(status_code=404, detail="商品不存在")
+
+                # ✅ 获取图片列表用于后续删除物理文件
+                raw_main = product.get('main_image', '[]')
+                raw_detail = product.get('detail_images', '[]')
+
+                image_urls_to_delete = []
+                try:
+                    if isinstance(raw_main, str) and raw_main.strip().startswith('['):
+                        image_urls_to_delete.extend(json.loads(raw_main))
+                    elif isinstance(raw_main, list):
+                        image_urls_to_delete.extend(raw_main)
+                except:
+                    pass
+
+                try:
+                    if isinstance(raw_detail, str) and raw_detail.strip().startswith('['):
+                        image_urls_to_delete.extend(json.loads(raw_detail))
+                    elif isinstance(raw_detail, list):
+                        image_urls_to_delete.extend(raw_detail)
+                except:
+                    pass
+
+                # 执行删除操作（外键会级联删除关联数据）
+                cur.execute("DELETE FROM products WHERE id = %s", (id,))
+
+                # 检查是否成功删除
+                if cur.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="商品删除失败或已被删除")
+
+                conn.commit()
+
+                # ✅ 异步删除物理文件（不影响主流程）
+                if image_urls_to_delete:
+                    from pathlib import Path
+                    for url in image_urls_to_delete:
+                        try:
+                            relative_path = url.lstrip('/').replace('pic/', '', 1)
+                            file_path = Path(str(BASE_PIC_DIR)) / relative_path
+                            if file_path.exists():
+                                file_path.unlink()
+                                print(f"✅ 已删除商品图片文件: {file_path}")
+                        except Exception as e:
+                            print(f"⚠️ 删除图片文件失败 {url}: {e}")
+
+                return {
+                    "status": "success",
+                    "message": f"商品 {id} 已成功删除",
+                    "data": {"product_id": id}
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                conn.rollback()
+                raise HTTPException(status_code=400, detail=f"删除商品失败: {str(e)}")
+
+
 @router.post("/products/{id}/images", summary="📸 上传商品图片")
 def upload_images(
         id: int,
@@ -974,7 +1049,7 @@ def get_sales_data(id: int):
 
             row = cur.fetchone()
             if not row or not row.get('qty'):
-            # 如果没有销售数据或查询结果为 NULL，返回 0 而不是 404
+                # 如果没有销售数据或查询结果为 NULL，返回 0 而不是 404
                 qty = int(row['qty']) if row and row.get('qty') else 0
                 sales = float(row['sales']) if row and row.get('sales') else 0.0
 
