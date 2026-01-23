@@ -47,7 +47,37 @@ async def create_jsapi_order(request: Request):
                     raise HTTPException(status_code=400, detail="order not in pending_pay state")
 
         # 1) 调用微信下单，获取 prepay_id
-        resp = pay_client.create_jsapi_order(out_trade_no=str(out_trade_no), total_fee=int(total_fee), openid=str(openid), description=description)
+        try:
+            resp = pay_client.create_jsapi_order(out_trade_no=str(out_trade_no), total_fee=int(total_fee), openid=str(openid), description=description)
+        except Exception as e:
+            # 尝试识别 requests.HTTPError 并提取响应体
+            try:
+                import requests
+                if isinstance(e, requests.exceptions.HTTPError) and hasattr(e, 'response'):
+                    body = ''
+                    try:
+                        body = e.response.text
+                    except Exception:
+                        body = str(e.response)
+                    logger.error(f"微信下单返回 HTTP 错误: status={getattr(e.response,'status_code', '')} body={body}")
+                    try:
+                        data = json.loads(body)
+                        code = data.get('code')
+                        message = data.get('message') or data.get('msg') or ''
+                    except Exception:
+                        code = None
+                        message = body
+
+                    if code == 'INVALID_REQUEST' or '参数与首次请求时不一致' in (message or ''):
+                        raise HTTPException(status_code=409, detail=f"微信订单重复且参数不一致: {message}")
+                    if 'JSAPI支付必须传openid' in (message or ''):
+                        raise HTTPException(status_code=422, detail=f"缺少 openid: {message}")
+                    raise HTTPException(status_code=502, detail=f"微信下单失败: {message}")
+            except HTTPException:
+                raise
+            except Exception:
+                logger.exception("微信下单异常")
+                raise HTTPException(status_code=502, detail=str(e))
         prepay_id = resp.get('prepay_id') or resp.get('prepayId')
         if not prepay_id:
             logger.error(f"下单失败，微信返回: {resp}")
@@ -159,14 +189,53 @@ async def wechat_pay_notify(request: Request):
 
         # 开发绕过：若请求头包含 X-DEV-PLAIN-BODY，则认为 resource 已是明文 JSON（跳过 decrypt）
         plain_header = headers.get("X-DEV-PLAIN-BODY") or headers.get("X-DEV-PLAIN")
+
+        # 检查 resource 是否具备解密所需字段
+        required_fields = ("ciphertext", "nonce", "associated_data")
+        missing_fields = [f for f in required_fields if f not in resource]
+        if missing_fields and not (plain_header and ENVIRONMENT != "production"):
+            logger.error(f"回调 resource 缺少必要字段 {missing_fields}; content={resource}")
+            return _xml_response("FAIL", f"Missing resource fields: {','.join(missing_fields)}")
+
+        # 记录 resource 关键字段长度以便排查解密失败
+        try:
+            logger.info(
+                "回调 resource 明细: keys=%s, ciphertext_len=%s, nonce_len=%s, ad_len=%s",
+                list(resource.keys()),
+                len(resource.get("ciphertext", "")) if isinstance(resource.get("ciphertext"), str) else None,
+                len(resource.get("nonce", "")) if isinstance(resource.get("nonce"), str) else None,
+                len(resource.get("associated_data", "")) if isinstance(resource.get("associated_data"), str) else None,
+            )
+        except Exception:
+            logger.debug("记录 resource 明细失败", exc_info=True)
+
         if plain_header and ENVIRONMENT != "production":
             logger.info("开发模式：跳过回调解密，直接使用明文 resource（X-DEV-PLAIN-BODY detected）")
             decrypted_data = resource
         else:
-            decrypted_data = pay_client.decrypt_callback_data(resource)
+            try:
+                decrypted_data = pay_client.decrypt_callback_data(resource)
+            except Exception as e:
+                logger.error(
+                    "回调解密异常: %s; resource_keys=%s; ciphertext_len=%s", 
+                    str(e),
+                    list(resource.keys()),
+                    len(resource.get("ciphertext", "")) if isinstance(resource.get("ciphertext"), str) else None,
+                )
+                return _xml_response("FAIL", "Decrypt failed")
 
         # 根据事件类型处理
         event_type = decrypted_data.get("event_type")
+        try:
+            logger.info(
+                "解密后 payload 概览: event_type=%s, keys=%s, out_trade_no=%s, transaction_id=%s",
+                event_type,
+                list(decrypted_data.keys()),
+                decrypted_data.get("out_trade_no"),
+                decrypted_data.get("transaction_id"),
+            )
+        except Exception:
+            logger.debug("记录解密后 payload 概览失败", exc_info=True)
 
         if event_type == "APPLYMENT_STATE_CHANGE":
             await handle_applyment_state_change(decrypted_data)
@@ -175,7 +244,7 @@ async def wechat_pay_notify(request: Request):
             await handle_transaction_success(decrypted_data)
             return _xml_response("SUCCESS", "OK")
         else:
-            logger.warning(f"未知的事件类型: {event_type}")
+            logger.warning(f"未知的事件类型: {event_type}; payload={decrypted_data}")
             return _xml_response("FAIL", f"Unknown event_type: {event_type}")
 
     except json.JSONDecodeError as e:
@@ -359,4 +428,7 @@ def register_wechat_pay_routes(app):
     注册微信支付路由
     注意：prefix 已在 router 中定义，这里不需要重复
     """
+    # 原生路径：/wechat-pay/*
     app.include_router(router)
+    # 兼容路径：/api/wechat-pay/* （微信通知回调当前发往 /api/wechat-pay/notify）
+    app.include_router(router, prefix="/api")
