@@ -30,27 +30,66 @@ async def create_jsapi_order(request: Request):
         raise HTTPException(status_code=400, detail="invalid JSON payload")
 
     out_trade_no = payload.get('out_trade_no') or payload.get('order_id')
-    total_fee = payload.get('total_fee')
+    total_fee_client = payload.get('total_fee')  # 分
     openid = payload.get('openid')
     description = payload.get('description', '商品支付')
 
-    if not out_trade_no or not total_fee or not openid:
+    if not out_trade_no or not total_fee_client or not openid:
         raise HTTPException(status_code=400, detail="missing out_trade_no/total_fee/openid")
 
     try:
         # 幂等校验：确保订单存在且处于待支付状态
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, user_id, status, delivery_way FROM orders WHERE order_number=%s", (out_trade_no,))
+                cur.execute(
+                    "SELECT id, user_id, status, delivery_way, total_amount, pending_points, pending_coupon_id "
+                    "FROM orders WHERE order_number=%s",
+                    (out_trade_no,)
+                )
                 order_row = cur.fetchone()
                 if not order_row:
                     raise HTTPException(status_code=404, detail="order not found")
                 if order_row.get('status') != 'pending_pay':
                     raise HTTPException(status_code=400, detail="order not in pending_pay state")
 
+                # 重新计算应付金额（分），防止前端传错
+                total_amount = Decimal(str(order_row.get('total_amount') or 0))
+                pending_points = Decimal(str(order_row.get('pending_points') or 0))
+                coupon_amt = Decimal('0')
+
+                pending_coupon_id = order_row.get('pending_coupon_id')
+                if pending_coupon_id:
+                    cur.execute("SELECT amount, status FROM coupons WHERE id=%s", (pending_coupon_id,))
+                    coupon_row = cur.fetchone()
+                    if coupon_row:
+                        coupon_amt = Decimal(str(coupon_row.get('amount') or 0))
+                        if coupon_row.get('status') == 'used':
+                            raise HTTPException(status_code=409, detail="coupon already used")
+
+                payable_cents = int(total_amount * Decimal('100'))
+                payable_cents -= int(pending_points * Decimal('100'))
+                payable_cents -= int(coupon_amt * Decimal('100'))
+
+                if payable_cents <= 0:
+                    raise HTTPException(status_code=400, detail="invalid payable amount")
+
+                if int(total_fee_client) != payable_cents:
+                    logger.warning(
+                        "订单支付金额校正: client=%s, server=%s, order=%s",
+                        total_fee_client, payable_cents, out_trade_no
+                    )
+                total_fee = payable_cents
+            
+        # 到这里无需持有连接，调用微信接口
+
         # 1) 调用微信下单，获取 prepay_id
         try:
-            resp = pay_client.create_jsapi_order(out_trade_no=str(out_trade_no), total_fee=int(total_fee), openid=str(openid), description=description)
+            resp = pay_client.create_jsapi_order(
+                out_trade_no=str(out_trade_no),
+                total_fee=int(total_fee),
+                openid=str(openid),
+                description=description
+            )
         except Exception as e:
             # 尝试识别 requests.HTTPError 并提取响应体
             try:
@@ -424,20 +463,49 @@ async def handle_transaction_success(data: dict):
                             logger.error(f"读取/校验优惠券失败: {e}")
                             return
 
+                    # 额外检测：若系统未记录优惠券，但微信回调包含 promotion_detail，则按微信优惠金额入账
+                    promo_detail = data.get("promotion_detail") or []
+                    promo_cents = 0
+                    try:
+                        for item in promo_detail:
+                            if not item:
+                                continue
+                            promo_cents += int(item.get("amount", 0) or 0)
+                    except Exception:
+                        promo_cents = 0
+
                     # 3) 金额校验（微信实付 vs 系统应付）
-                    payable_cents = int(total_amount_db * Decimal('100'))
+                    payable_cents_calc = int(total_amount_db * Decimal('100'))
                     try:
-                        payable_cents -= int(pending_points * Decimal('100'))
+                        payable_cents_calc -= int(pending_points * Decimal('100'))
                     except Exception:
-                        payable_cents -= int(pending_points)  # 兜底
+                        payable_cents_calc -= int(pending_points)  # 兜底
                     try:
-                        payable_cents -= int(coupon_amount * Decimal('100'))
+                        payable_cents_calc -= int(coupon_amount * Decimal('100'))
                     except Exception:
-                        payable_cents -= int(coupon_amount)
+                        payable_cents_calc -= int(coupon_amount)
+
+                    # 若微信存在 promotion_detail 且系统未记录优惠券，则使用微信的优惠金额修正 coupon_amount
+                    if promo_cents > 0 and not pending_coupon_id:
+                        promo_coupon = Decimal(str(promo_cents)) / Decimal('100')
+                        coupon_amount += promo_coupon
+                        payable_cents_calc -= promo_cents
+                        logger.info(
+                            "检测到微信优惠券未在系统记录，按回调优惠金额入账: %s（分）", promo_cents
+                        )
+
+                    payable_cents = payable_cents_calc
 
                     if amount is not None and int(amount) != payable_cents:
-                        logger.error(f"金额不一致，微信={amount}分，系统应收={payable_cents}分")
-                        return
+                        logger.error(
+                            "金额不一致，微信=%s分，系统应收=%s分，继续按微信实收入账处理",
+                            amount, payable_cents
+                        )
+                        # 以微信实收为准，避免阻断后续结算/积分/分账；并将差额视为额外优惠
+                        diff_cents = payable_cents - int(amount)
+                        if diff_cents > 0:
+                            coupon_amount += Decimal(str(diff_cents)) / Decimal('100')
+                        payable_cents = int(amount)
 
                     # amount 单位为分，转换为 Decimal 元（FinanceService 内部可能期望元）
                     pay_amount = None

@@ -12,9 +12,9 @@ class OrderException(FinanceException):
 
 class InsufficientBalanceException(FinanceException):
     """余额不足异常"""
-    def __init__(self, account_type: str, required_amount, balance):
+    def __init__(self, account_type: str, required_amount, balance, message: str | None = None):
         self.account_type = account_type
         self.required_amount = required_amount
         self.balance = balance
-        message = f"账户 {account_type} 余额不足: 需要 {required_amount}, 当前 {balance}"
-        super().__init__(message)
+        final_message = message or f"账户 {account_type} 余额不足: 需要 {required_amount}, 当前 {balance}"
+        super().__init__(final_message)
