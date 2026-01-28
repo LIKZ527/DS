@@ -229,7 +229,7 @@ class OrderManager:
                     cur.execute("DELETE FROM cart WHERE user_id = %s AND selected = 1", (user_id,))
 
                 # ---------- 8. 资金拆分 ----------
-                split_order_funds(order_number, total, has_vip, cursor=cur)
+                # 下单时不再拆分资金，改在支付成功后进行，避免资金池余额被预扣
 
                 conn.commit()
                 return order_number
@@ -321,6 +321,49 @@ class OrderManager:
                     "items": items,
                     "specifications": order.get("refund_reason"),
                 }
+
+    @staticmethod
+    def update_status(order_number: str, new_status: str, reason: Optional[str] = None,
+                      external_conn=None) -> bool:
+        """统一的订单状态更新，支持外部连接复用。"""
+        def _apply_update(cur) -> bool:
+            cur.execute("SHOW COLUMNS FROM orders")
+            cols = {row.get("Field") for row in cur.fetchall()}
+
+            updates = ["status=%s", "updated_at=NOW()"]
+            params: List[Any] = [new_status]
+
+            # 需要记录原因时，优先写入 status_reason / remark，避免覆盖 refund_reason
+            if reason:
+                for col in ("status_reason", "remark"):
+                    if col in cols:
+                        updates.append(f"{col}=%s")
+                        params.append(reason)
+                        break
+
+            if new_status in ("pending_ship", "pending_recv") and "paid_at" in cols:
+                updates.append("paid_at=COALESCE(paid_at, NOW())")
+            if new_status == "pending_recv" and "shipped_at" in cols:
+                updates.append("shipped_at=COALESCE(shipped_at, NOW())")
+            if new_status == "completed" and "completed_at" in cols:
+                updates.append("completed_at=COALESCE(completed_at, NOW())")
+
+            params.append(order_number)
+            cur.execute(f"UPDATE orders SET {', '.join(updates)} WHERE order_number=%s", tuple(params))
+            return cur.rowcount > 0
+
+        if external_conn:
+            cur = external_conn.cursor()
+            try:
+                return _apply_update(cur)
+            finally:
+                cur.close()
+        else:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    updated = _apply_update(cur)
+                    conn.commit()
+                    return updated
 
     @staticmethod
     def export_to_excel(order_numbers: List[str]) -> bytes:
