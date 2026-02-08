@@ -189,8 +189,27 @@ class WechatApplymentService:
                             'business_category'):
                         raise HTTPException(status_code=400, detail="经营类目不可修改")
 
+                # 提交前关键字段校验（避免把必填缺失的请求发给微信）
+                contact_info_raw = applyment.get("contact_info")
+                contact_info = json.loads(contact_info_raw) if isinstance(contact_info_raw, str) else contact_info_raw
+                if not contact_info or not contact_info.get("contact_name"):
+                    logger.warning(
+                        "用户 %s 进件提交前缺少 contact_name，business_code=%s",
+                        user_id,
+                        applyment.get("business_code"),
+                    )
+                    raise HTTPException(status_code=400, detail="请填写超级管理员姓名（contact_name）后再提交")
+
                 # 调用微信支付API提交进件
                 try:
+                    payload_snapshot = {
+                        "applyment_db_id": applyment.get("id"),
+                        "business_code": applyment.get("business_code"),
+                        "subject_type": applyment.get("subject_type"),
+                        "has_contact_info": bool(applyment.get("contact_info")),
+                        "has_subject_info": bool(applyment.get("subject_info")),
+                        "has_bank_account_info": bool(applyment.get("bank_account_info")),
+                    }
                     response = self.pay_client.submit_applyment(applyment)
                     applyment_id = response.get("applyment_id")
 
@@ -226,7 +245,30 @@ class WechatApplymentService:
 
                 except Exception as e:
                     conn.rollback()
-                    logger.error(f"用户 {user_id} 提交进件失败: {str(e)}")
+                    http_resp = getattr(e, "response", None)
+                    status_code = getattr(http_resp, "status_code", None)
+                    resp_body = None
+                    if http_resp is not None:
+                        try:
+                            resp_body = http_resp.text[:1500]
+                        except Exception:
+                            resp_body = "<read_response_failed>"
+
+                    wx_applyment_id = None
+                    if "response" in locals():
+                        wx_applyment_id = response.get("applyment_id") if isinstance(response, dict) else None
+
+                    logger.exception(
+                        "用户 %s 提交进件失败: %s | db_applyment_id=%s business_code=%s wx_applyment_id=%s status=%s resp_body=%s payload=%s",
+                        user_id,
+                        str(e),
+                        applyment.get("id"),
+                        applyment.get("business_code"),
+                        wx_applyment_id,
+                        status_code,
+                        resp_body,
+                        payload_snapshot,
+                    )
                     raise HTTPException(status_code=500, detail=f"提交失败: {str(e)}")
 
     async def upload_media(self, user_id: int, file: UploadFile, media_type: str) -> dict:
